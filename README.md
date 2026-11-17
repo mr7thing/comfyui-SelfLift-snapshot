@@ -34,6 +34,31 @@ Extra inputs: `upscaler_model`, `upscaler_unload` (default on: unloads the upsca
 
 Download from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) into `ComfyUI/models/latent_upscale_models/` and restart. The node selects the first filename containing `h3`, otherwise `none` (nearest-neighbor lift).
 
+## Draft and resume (MiniMax H3)
+
+Two nodes cut the run in half at the resolution transition, so a clip can be tried out cheaply and finished later from the same state.
+
+| Node | What it does |
+| --- | --- |
+| `SelfLiftH3Draft` | Runs the low-resolution prefix only, draws a draft video through the preview VAE, and freezes the run into a snapshot: the sampler state, the endpoint prediction, the prompt conditioning, the sigma schedule, the parameters and the workflow that produced it. |
+| `SelfLiftH3Resume` | Reads a snapshot back, lifts it to the target resolution and finishes the schedule. |
+
+The draft costs `transition_step` denoiser evaluations at `lowres_scale`; the resume costs the rest. Together they land on exactly the clip a single run would have produced — the draft and the resume are one run, cut in two.
+
+The draft node takes an optional `audio_vae`. Connect the H3 audio VAE and the draft mp4 carries a soundtrack: the model's own estimate of the soundscape at the freeze point, which is still a rough one — the finished clip's audio is denoised all the way down and will differ in detail. Leave the VAE out and the draft is silent. The frozen audio latent rides along in the snapshot either way, so the finished clip always has sound.
+
+Snapshots live in `output/selflift_drafts/`, one set per draft:
+
+- `<name>.json` — the manifest: parameters, sigmas, seed, cfg, the structure of the prompt conditioning, the model it was frozen with and the workflow that produced it.
+- `<name>.safetensors` — the tensors: the frozen state, the endpoint prediction, the latent content, the noise mask and the conditioning.
+- `<name>.mp4` — the draft video, drawn with the preview VAE in `models/vae_approx` and scaled to the target resolution. Its frame count and its length are the clip's own.
+
+The conditioning is frozen as it was: the text embedding, and the reference images and sounds H3 keeps in it, encoded. The resume reads them back, so its graph needs no prompt and no reference images — only the model, the VAE and the sampler.
+
+The draft node reports where it put things: the paths of the snapshot and of the draft video come back in the run history under the node's `snapshot` and `draft_video` entries, so an agent that posted the prompt can pick them up without guessing.
+
+`workflows/h3-draft.api.json` and `workflows/h3-resume.api.json` are the two graphs in the API format, ready for `POST /prompt`: the draft graph is the usual H3 workflow with the sampler swapped for the draft node, and the resume graph keeps only the model chain and points at a snapshot. `workflows/H3 SelfLift Draft｜Freeze and Preview.json` and `workflows/H3 SelfLift Resume｜Continue from Snapshot.json` are the same two graphs in the UI format, derived from the "H3 SelfLift Dual Sample" workflow: import them, run the draft, paste the snapshot path into the resume node.
+
 ## H3 Temporal State Transport (TST)
 
 A `MODEL` → `MODEL` patch node that improves the temporal stability of H3 videos at inference time — no training, no extra model, ~1–2% runtime overhead. Typical problems it counteracts: details that flicker or morph between frames (logos, on-screen text, textures), identity drift of people and outfits, and physically implausible motion. It works with any standard sampler node, not only the SelfLift sampler. It cannot create detail the model does not have.

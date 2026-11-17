@@ -32,6 +32,8 @@ from . import selflift
 from . import h3_upscaler
 from . import h3_tiling
 from . import h3_tst
+from . import h3_snapshot
+from . import h3_draft_video
 from .diagnostics import log_memory
 
 
@@ -226,12 +228,14 @@ def _debug_dump(vae, latents):
         Image.fromarray(frame).save(os.path.join(out_dir, name + ".png"))
 
 
-def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
-                       transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
-                       highres_tiling=False, model_hires=None):
+def _setup_run(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
+               transition_step, lowres_scale, rho, w_min, w_max, latent_upsample,
+               latent_lifter=None, highres_tiling=False, model_hires=None):
+    """Validate a run and build what both sampling stages share.
+
+    Nothing here samples; the returned dict is what the stage functions read.
+    """
     _validate_schedule(sigmas, transition_step)
-    if sigmas.numel() < 2:
-        return latent_image
     if not 0.25 <= lowres_scale <= 1.0:
         raise ValueError("SelfLift: lowres_scale must be between 0.25 and 1")
     if not 0.0 <= rho <= 1.0:
@@ -334,6 +338,34 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     else:
         positive_low, negative_low = positive, negative
 
+    latent_format = model.get_model_object("latent_format")
+    resolution_scale = getattr(latent_format, "spacial_downscale_ratio", 1)
+
+    return {
+        "model": model, "vae": vae, "sampler": sampler, "sigmas": sigmas, "seed": seed, "cfg": cfg,
+        "latent_image": latent_image, "transition_step": transition_step,
+        "lowres_scale": lowres_scale, "rho": rho, "w_min": w_min, "w_max": w_max,
+        "latent_upsample": latent_upsample, "latent_lifter": latent_lifter,
+        "highres_tiling": highres_tiling, "model_hires": model_hires,
+        "model_sampling": model_sampling, "latent_format": latent_format,
+        "device": device, "nested": nested, "video": video,
+        "shape": (b, c, t, H, W), "low_shape": low_shape, "latent_hw": (h, w),
+        "noise_mask": noise_mask, "m_full": m_full, "m_low": m_low,
+        "video_anchor": video_anchor, "low_anchor": low_anchor,
+        "low_latent": low_latent, "low_model": low_model, "high_model": high_model,
+        "positive_low": positive_low, "negative_low": negative_low, "noise_low": noise_low,
+        "callback": callback, "disable_pbar": disable_pbar, "total_steps": total_steps,
+        "resolution_scale": resolution_scale,
+    }
+
+
+def _run_low_stage(run):
+    """Sample the low-resolution prefix and hand back the frozen state."""
+    model = run["model"]
+    sigmas = run["sigmas"]
+    transition_step = run["transition_step"]
+    h, w = run["latent_hw"]
+    t, H, W = run["shape"][2], run["shape"][3], run["shape"][4]
     transition = {}
     low_evaluations = 0
 
@@ -349,7 +381,7 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         # Preview decoders expect the target grid.  Decode a temporary lifted
         # preview while keeping the sampler state at its true low resolution.
         preview_x0 = x0
-        if video:
+        if run["video"]:
             preview_streams, preview_nested = _streams(x0)
             preview_video = torch.nn.functional.interpolate(
                 preview_streams[0].float(), size=(t, H, W), mode="trilinear", align_corners=False
@@ -360,35 +392,53 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
             preview_x0 = torch.nn.functional.interpolate(
                 x0.float(), size=(H, W), mode="bilinear", align_corners=False
             ).to(x0.dtype)
-        result = callback(step, preview_x0, preview_x0, total_steps)
+        result = run["callback"](step, preview_x0, preview_x0, run["total_steps"])
         del preview_x0
         low_timer.mark(f"step {step + 1}/{transition_step}" + (" (includes setup)" if step == 0 else ""))
         return result
 
-    # The final low-resolution model evaluation is the Eq. 3 prediction. Its Euler
-    # update is discarded and rebuilt after the resolution transition, preserving NFE.
-    resolution_scale = (getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1)
-                        if video else getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1))
-    low_timer = _StageTimer("low_resolution", low_model.load_device, (h, w), resolution_scale)
-    log_memory("low_resolution start", low_model.load_device)
-    comfy.samplers.sample(low_model, noise_low, positive_low, negative_low, cfg, low_model.load_device,
-                          sampler, sigmas[:transition_step + 1], low_model.model_options,
-                          latent_image=low_latent, callback=callback_low,
-                          disable_pbar=disable_pbar, seed=seed)
+    low_timer = _StageTimer("low_resolution", run["low_model"].load_device, (h, w),
+                            run["resolution_scale"])
+    log_memory("low_resolution start", run["low_model"].load_device)
+    comfy.samplers.sample(run["low_model"], run["noise_low"], run["positive_low"], run["negative_low"],
+                          run["cfg"], run["low_model"].load_device,
+                          run["sampler"], sigmas[:transition_step + 1], run["low_model"].model_options,
+                          latent_image=run["low_latent"], callback=callback_low,
+                          disable_pbar=run["disable_pbar"], seed=run["seed"])
     if low_evaluations != transition_step:
         raise RuntimeError(f"SelfLift: expected {transition_step} low-resolution callbacks, received {low_evaluations}; check sampler wrappers")
     low_timer.finish()
     log_memory("low_resolution end", model.load_device)
-    transition_timer = _StageTimer("transition", model.load_device, (H, W), resolution_scale)
-    low_streams, nested = _streams(transition.pop("state"))
-    x0_streams, _ = _streams(transition.pop("x0"))
+    for spent in ("low_latent", "noise_low", "positive_low", "negative_low"):
+        run.pop(spent, None)
+    return {"state": transition["state"], "x0": transition["x0"]}
+
+def _run_transition(run, state, x0):
+    """Lift the frozen endpoint to the target resolution and re-noise it.
+
+    The final low-resolution model evaluation is the Eq. 3 prediction. Its Euler
+    update is discarded and rebuilt here, preserving NFE.
+    """
+    model = run["model"]
+    vae = run["vae"]
+    sigmas = run["sigmas"]
+    transition_step = run["transition_step"]
+    device = run["device"]
+    latent_format = run["latent_format"]
+    model_sampling = run["model_sampling"]
+    nested = run["nested"]
+    H, W = run["shape"][3], run["shape"][4]
+    rho, w_min, w_max = run["rho"], run["w_min"], run["w_max"]
+
+    transition_timer = _StageTimer("transition", model.load_device, (H, W), run["resolution_scale"])
+    low_streams, nested = _streams(state)
+    x0_streams, _ = _streams(x0)
     sigma_k = sigmas[transition_step - 1]
     sigma_next = sigmas[transition_step]
-    auxiliary_next = [_euler_step(state.to(device), denoised.to(device), sigma_k, sigma_next)
-                      for state, denoised in zip(low_streams[1:], x0_streams[1:])]
-    latent_format = model.get_model_object("latent_format")
+    auxiliary_next = [_euler_step(stream.to(device), denoised.to(device), sigma_k, sigma_next)
+                      for stream, denoised in zip(low_streams[1:], x0_streams[1:])]
     z0_low_vae = latent_format.process_out(x0_streams[0].float()).to(device)
-    del low_latent, noise_low, low_streams, x0_streams, positive_low, negative_low
+    del low_streams, x0_streams
     transition_timer.mark("prepare_endpoint")
     log_memory("transition endpoint_ready", model.load_device)
 
@@ -396,17 +446,17 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     need_pix = rho > 0.0 and w_max > 0.0
     need_lat = not (rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0)
     z_lat_vae, z_pix_vae = selflift.paired_lifts(
-        z0_low_vae, vae, (H, W), latent_upsample, latent_lifter,
+        z0_low_vae, vae, (H, W), run["latent_upsample"], run["latent_lifter"],
         need_lat=need_lat, need_pix=need_pix)
     transition_timer.mark("paired_lifts")
     log_memory("transition lifts_ready", model.load_device)
     z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
     z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
-    z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max, mask=m_full)
-    if m_full is not None:
+    z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max, mask=run["m_full"])
+    if run["m_full"] is not None:
         # restore the keep-region with the true original instead of any lifted estimate
-        m_cast = m_full.to(device=z0_high.device, dtype=z0_high.dtype)
-        z0_high = z0_high * m_cast + video_anchor * (1.0 - m_cast)
+        m_cast = run["m_full"].to(device=z0_high.device, dtype=z0_high.dtype)
+        z0_high = z0_high * m_cast + run["video_anchor"] * (1.0 - m_cast)
     if os.environ.get("SELFLIFT_DEBUG", "0") == "1":
         _debug_dump(vae, {
             "z0_low": z0_low_vae,
@@ -421,8 +471,8 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
 
     # Re-noise the corrected video/image endpoint at the sigma of the reused model
     # evaluation, then complete that Euler interval without another denoiser call.
-    video_noise = comfy.sample.prepare_noise(z0_high, (seed + 1) % (1 << 64),
-                                             latent_image.get("batch_index", None)).to(z0_high)
+    video_noise = comfy.sample.prepare_noise(z0_high, (run["seed"] + 1) % (1 << 64),
+                                             run["latent_image"].get("batch_index", None)).to(z0_high)
     video_state = model_sampling.noise_scaling(sigma_k, video_noise, z0_high)
     next_streams = [_euler_step(video_state, z0_high, sigma_k, sigma_next)] + auxiliary_next
     del z0_high, video_noise, video_state, auxiliary_next
@@ -433,7 +483,16 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     transition_timer.mark("renoise")
     transition_timer.finish()
     log_memory("transition end / high_resolution start", model.load_device)
+    return {"latent": resume_latent, "noise": resume_noise}
 
+
+def _run_high_stage(run, resume, positive, negative):
+    """Finish the schedule at the target resolution."""
+    model = run["model"]
+    sigmas = run["sigmas"]
+    transition_step = run["transition_step"]
+    total_steps = run["total_steps"]
+    H, W = run["shape"][3], run["shape"][4]
     high_evaluations = 0
 
     def callback_high(step, x0, x, total):
@@ -442,27 +501,41 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         high_evaluations += 1
         if high_evaluations > total_steps - transition_step:
             raise RuntimeError("SelfLift: too many high-resolution callbacks for the Euler schedule")
-        result = callback(step + transition_step, x0, x, total_steps)
+        result = run["callback"](step + transition_step, x0, x, total_steps)
         high_timer.mark(f"step {step + 1}/{total_steps - transition_step}" + (" (includes setup)" if step == 0 else ""))
         return result
 
-    high_timer = _StageTimer("high_resolution", model.load_device, (H, W), resolution_scale)
-    if highres_tiling:
+    high_timer = _StageTimer("high_resolution", model.load_device, (H, W), run["resolution_scale"])
+    if run["highres_tiling"]:
         logging.info("[SelfLift plan] automatic high-resolution tiling enabled; preparation selects the tile count")
-    out = comfy.samplers.sample(high_model, resume_noise, positive, negative, cfg, model.load_device,
-                                sampler, sigmas[transition_step:], high_model.model_options,
-                                latent_image=resume_latent, callback=callback_high,
-                                disable_pbar=disable_pbar, seed=seed)
-    del resume_latent, resume_noise
+    out = comfy.samplers.sample(run["high_model"], resume["noise"], positive, negative, run["cfg"],
+                                model.load_device, run["sampler"], sigmas[transition_step:],
+                                run["high_model"].model_options,
+                                latent_image=resume["latent"], callback=callback_high,
+                                disable_pbar=run["disable_pbar"], seed=run["seed"])
     if high_evaluations != total_steps - transition_step:
         raise RuntimeError(f"SelfLift: expected {total_steps - transition_step} high-resolution callbacks, received {high_evaluations}; check sampler wrappers")
 
-    result = latent_image.copy()
+    result = run["latent_image"].copy()
     result["samples"] = out.to(device=comfy.model_management.intermediate_device(),
                                 dtype=comfy.model_management.intermediate_dtype())
     high_timer.finish()
     log_memory("high_resolution end", model.load_device)
     return result
+
+
+def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
+                       transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
+                       highres_tiling=False, model_hires=None):
+    _validate_schedule(sigmas, transition_step)
+    if sigmas.numel() < 2:
+        return latent_image
+    run = _setup_run(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
+                     transition_step, lowres_scale, rho, w_min, w_max, latent_upsample,
+                     latent_lifter=latent_lifter, highres_tiling=highres_tiling, model_hires=model_hires)
+    frozen = _run_low_stage(run)
+    resume = _run_transition(run, frozen["state"], frozen["x0"])
+    return _run_high_stage(run, resume, positive, negative)
 
 
 class SelfLiftH3Sampler:
@@ -510,6 +583,234 @@ class SelfLiftH3Sampler:
         return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
                                    latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires),)
+
+
+def _draft_folder():
+    """Where drafts and their snapshots live."""
+    import folder_paths
+
+    folder = os.path.join(folder_paths.get_output_directory(), "selflift_drafts")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _snapshot_stem(name):
+    """A file stem for one snapshot that no other draft can take."""
+    import time
+
+    safe = "".join(char if char.isalnum() or char in "-_" else "_" for char in (name or "draft")).strip("_")
+    folder = _draft_folder()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stem = os.path.join(folder, f"{safe}_{stamp}")
+    counter = 1
+    while os.path.exists(stem + ".json"):
+        stem = os.path.join(folder, f"{safe}_{stamp}-{counter}")
+        counter += 1
+    return stem
+
+
+def _model_identity(model):
+    """What a snapshot has to know about the model it was frozen with."""
+    latent_format = model.get_model_object("latent_format")
+    return {
+        "class": type(model.model).__name__,
+        "latent_format": type(latent_format).__name__,
+        "spatial_ratio": getattr(latent_format, "spacial_downscale_ratio", None),
+        "temporal_ratio": getattr(latent_format, "temporal_downscale_ratio", None),
+    }
+
+
+def _audio_scale(run):
+    """The factor the sampler carries the audio stream at (H3: shift / audio_shift).
+
+    The sampler works on the audio stream scaled onto the video schedule, so a
+    frozen endpoint has to be brought back to the audio VAE's own scale before
+    it can be decoded. The scale is the model's own (shift / audio_shift), the
+    one `process_latent_in` applied when the run started.
+    """
+    scale = getattr(run["model_sampling"], "audio_scale", None)
+    if scale is not None:
+        return float(scale)
+    getter = getattr(run["model"].model, "audio_scale", None)
+    if getter is not None:
+        return float(getter())
+    return 1.0
+
+
+def _write_draft_video(run, x0, stem, audio_vae=None):
+    """Draw the frozen endpoint with the fast preview VAE and write it as an mp4.
+
+    The soundtrack comes from the same frozen endpoint: its audio latent goes
+    through the H3 audio VAE, which is small enough to be worth the seconds.
+    """
+    vae = h3_draft_video.preview_vae()
+    if vae is None:
+        return None
+    streams, nested = _streams(x0)
+    latent = run["latent_format"].process_out(streams[0].float())
+    frames = h3_draft_video.decode_frames(vae, latent)
+    H, W = run["shape"][3], run["shape"][4]
+    ratio = run["resolution_scale"]
+    frames = h3_draft_video.upscale(frames, (int(H * ratio), int(W * ratio)))
+    audio = None
+    sample_rate = 32000
+    if audio_vae is not None and nested and len(streams) > 1:
+        scale = _audio_scale(run)
+        audio_latent = streams[1].float()
+        if scale != 1.0:
+            audio_latent = audio_latent / scale
+        waveform, sample_rate = h3_draft_video.decode_audio(audio_vae, audio_latent)
+        audio = waveform[0].detach().float().cpu()
+    path = stem + ".mp4"
+    h3_draft_video.write_video(frames, path, fps=24.0, audio=audio,
+                                audio_sample_rate=sample_rate)
+    return path
+
+
+class SelfLiftH3Draft:
+    """Sample the low-resolution prefix, draw the draft video and freeze the state.
+
+    A draft costs a fraction of a full run: the first `transition_step` denoiser
+    evaluations at `lowres_scale`. What it leaves behind is the frozen sampler
+    state, the endpoint prediction, the prompt conditioning and the parameters --
+    enough for a later run to lift the clip to the target resolution and finish
+    the schedule without sampling the prefix again.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "positive": ("CONDITIONING",),
+            "negative": ("CONDITIONING",),
+            "latent_image": ("LATENT", {"tooltip": "Target-resolution H3 AV latent defining size and duration. Its content is the keep-region anchor, so it is frozen with the draft."}),
+            "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
+            "sigmas": ("SIGMAS",),
+            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+            "cfg": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
+            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. The draft stops here and the resume continues from it."}),
+            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix (paper: 0.5)."}),
+            "rho": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of highest-risk spatiotemporal locations corrected toward the pixel-VAE anchor. Frozen with the draft; the resume applies it."}),
+            "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength floor. H3's widespread nearest-lift error can require 1.0."}),
+            "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength ceiling."}),
+            "upscaler_model": _upscaler_input(),
+            "snapshot_name": ("STRING", {"default": "h3-draft", "tooltip": "Name of the snapshot. A timestamp is added, so drafts never overwrite each other."}),
+            "draft_video": ("BOOLEAN", {"default": True, "label_on": "保存草稿视频：开启", "label_off": "保存草稿视频：关闭", "tooltip": "Draw the frozen endpoint through the preview VAE in models/vae_approx and write it as an mp4 beside the snapshot."}),
+        }, "optional": {
+            "audio_vae": ("VAE", {"tooltip": "Optional: the H3 audio VAE. Connect it and the draft mp4 carries the soundtrack of the frozen clip."}),
+            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental: split the high-resolution phase into spatial tiles to save VRAM. The resume applies it."}),
+            "upscaler_unload": ("BOOLEAN", {"default": True, "label_on": "放大后卸载：开启", "label_off": "放大后卸载：关闭", "tooltip": "Unload the external H3 upscaler from VRAM right after the lift, before the high-resolution stage loads."}),
+        }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
+
+    RETURN_TYPES = ("LATENT", "STRING", "STRING")
+    RETURN_NAMES = ("frozen_latent", "snapshot", "draft_video")
+    FUNCTION = "sample"
+    CATEGORY = "selflift"
+    OUTPUT_NODE = True
+
+    def sample(self, model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
+               transition_step, lowres_scale, rho, w_min, w_max, upscaler_model,
+               snapshot_name, draft_video=True, highres_tiling=False, upscaler_unload=True,
+               audio_vae=None, prompt=None, extra_pnginfo=None):
+        if rho == 0.0 and upscaler_model == "none":
+            logging.warning("SelfLift draft: rho=0 with upscaler_model=none leaves the resume "
+                            "with neither a correction nor a latent lift")
+        run = _setup_run(model, positive, negative, None, latent_image, sampler, sigmas, seed, cfg,
+                         transition_step, lowres_scale, rho, w_min, w_max, "nearest",
+                         latent_lifter=None, highres_tiling=highres_tiling, model_hires=None)
+        frozen = _run_low_stage(run)
+        stem = _snapshot_stem(snapshot_name)
+        video_path = _write_draft_video(run, frozen["x0"], stem, audio_vae) if draft_video else None
+        snapshot = h3_snapshot.Snapshot(
+            state=frozen["state"], x0=frozen["x0"], nested=run["nested"],
+            original=latent_image["samples"], mask=run["noise_mask"],
+            positive=positive, negative=negative, sigmas=sigmas, seed=seed, cfg=cfg,
+            params={
+                "transition_step": transition_step, "lowres_scale": lowres_scale,
+                "rho": rho, "w_min": w_min, "w_max": w_max,
+                "upscaler_model": upscaler_model, "highres_tiling": highres_tiling,
+                "upscaler_unload": upscaler_unload,
+                "latent_extra": {name: value for name, value in latent_image.items()
+                                 if name not in ("samples", "noise_mask")},
+            },
+            meta={
+                "model": _model_identity(model),
+                "prompt": prompt,
+                "ui_workflow": (extra_pnginfo or {}).get("workflow"),
+                "draft_video": video_path,
+                "target_latent": list(run["shape"]),
+                "low_latent": list(run["low_shape"]),
+            })
+        manifest_path = h3_snapshot.save(snapshot, stem)
+        logging.info("[SelfLift draft] snapshot=%s video=%s", manifest_path, video_path)
+        frozen_latent = latent_image.copy()
+        frozen_latent["samples"] = frozen["x0"]
+        # ComfyUI keeps a node's results in the run history only when it hands
+        # back a "ui" payload, so the paths travel with the outputs.
+        note = f"snapshot: {manifest_path}"
+        if video_path:
+            note += f"\ndraft video: {video_path}"
+        ui = {"snapshot": [manifest_path], "draft_video": [video_path or ""], "text": [note]}
+        return {"ui": ui, "result": (frozen_latent, manifest_path, video_path or "")}
+
+
+class SelfLiftH3Resume:
+    """Continue a frozen H3 draft: lift it to the target resolution and finish the schedule.
+
+    The snapshot carries the frozen sampler state, the endpoint prediction, the
+    prompt conditioning, the sigma schedule and the parameters, so this node
+    only needs the model, the VAE and the sampler to finish the clip.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL", {"tooltip": "The same model chain the draft was sampled with. The snapshot records which one that was."}),
+            "vae": ("VAE", {"tooltip": "Video VAE used for the pixel re-encode anchor at the resolution transition."}),
+            "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
+            "snapshot_path": ("STRING", {"default": "", "tooltip": "The manifest a draft wrote, e.g. output/selflift_drafts/<name>.json."}),
+        }, "optional": {
+            "model_hires": ("MODEL", {"tooltip": "Optional: model used for the high-resolution stage instead of `model` (e.g. a different checkpoint or LoRA stack). Must share the same architecture and latent format."}),
+        }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    CATEGORY = "selflift"
+
+    def sample(self, model, vae, sampler, snapshot_path, model_hires=None, prompt=None, extra_pnginfo=None):
+        snapshot = h3_snapshot.load(snapshot_path)
+        params = snapshot.params
+        for key in ("transition_step", "lowres_scale", "rho", "w_min", "w_max"):
+            if key not in params:
+                raise ValueError(f"SelfLift: the snapshot has no {key}; it was written by another build")
+        recorded = snapshot.meta.get("model", {})
+        current = _model_identity(model)
+        if recorded.get("latent_format") and recorded["latent_format"] != current["latent_format"]:
+            raise ValueError(f"SelfLift: the snapshot was frozen with latent format "
+                             f"{recorded['latent_format']}, this model uses {current['latent_format']}")
+        if recorded.get("class") and recorded["class"] != current["class"]:
+            logging.warning("SelfLift: the snapshot was frozen with model %s, this run uses %s",
+                            recorded["class"], current["class"])
+        upscaler_model = params.get("upscaler_model", "none")
+        lifter = None
+        if upscaler_model != "none":
+            unload = bool(params.get("upscaler_unload", True))
+            lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=unload)
+        latent_image = {"samples": snapshot.original}
+        if snapshot.mask is not None:
+            latent_image["noise_mask"] = snapshot.mask
+        latent_image.update(params.get("latent_extra", {}))
+        run = _setup_run(model, snapshot.positive, snapshot.negative, vae, latent_image, sampler,
+                         snapshot.sigmas, snapshot.seed, snapshot.cfg,
+                         int(params["transition_step"]), float(params["lowres_scale"]),
+                         float(params["rho"]), float(params["w_min"]), float(params["w_max"]),
+                         "nearest", latent_lifter=lifter,
+                         highres_tiling=bool(params.get("highres_tiling", False)),
+                         model_hires=model_hires)
+        state = snapshot.state
+        x0 = snapshot.x0
+        resume = _run_transition(run, state, x0)
+        return (_run_high_stage(run, resume, snapshot.positive, snapshot.negative),)
 
 
 class SelfLiftImageSampler:
@@ -571,12 +872,16 @@ class SelfLiftH3TST:
 
 NODE_CLASS_MAPPINGS = {
     "SelfLiftH3Sampler": SelfLiftH3Sampler,
+    "SelfLiftH3Draft": SelfLiftH3Draft,
+    "SelfLiftH3Resume": SelfLiftH3Resume,
     "SelfLiftImageSampler": SelfLiftImageSampler,
     "SelfLiftH3TST": SelfLiftH3TST,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SelfLiftH3Sampler": "SelfLift Progressive Sampler (MiniMax H3)",
+    "SelfLiftH3Draft": "SelfLift H3 Draft (freeze the low-resolution prefix)",
+    "SelfLiftH3Resume": "SelfLift H3 Resume (continue a frozen draft)",
     "SelfLiftImageSampler": "SelfLift Progressive Sampler (Image)",
     "SelfLiftH3TST": "H3 Temporal State Transport (TST)",
 }

@@ -34,6 +34,31 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 
 从 [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载，放入 `ComfyUI/models/latent_upscale_models/` 后重启。节点默认选第一个文件名含 `h3` 的模型，找不到则为 `none`(nearest 提升）。
 
+## 草稿与恢复（MiniMax H3）
+
+两个节点把一次运行在分辨率过渡处切成两半：先用很低的代价试想法，批准后再从同一个状态接着做完。
+
+| 节点 | 作用 |
+| --- | --- |
+| `SelfLiftH3Draft` | 只跑低分辨率前缀，用快速预览 VAE 画出一份草稿视频，并把这次运行冻结成快照：采样器状态、端点预测、提示词条件、sigma 调度、参数，以及产生它的工作流 |
+| `SelfLiftH3Resume` | 读回快照，把它提升到目标分辨率并跑完剩下的调度 |
+
+草稿只花 `transition_step` 次去噪评估（`lowres_scale` 分辨率下），恢复花掉剩下的部分。两者合起来的结果与一次完整运行**逐位相同**——草稿和恢复就是同一次运行的两半。
+
+草稿节点有一个可选输入 `audio_vae`。接上 H3 音频 VAE，草稿 mp4 就带上声景——那是模型在冻结那一刻对声景的估计，还很粗糙；成片的音频是一路去噪到底的结果，细节会和草稿不同。不接则草稿是静音的。音频 latent 无论如何都随快照一起冻结，所以最终成片一定有声音。
+
+快照写在 `output/selflift_drafts/`，每次草稿一组：
+
+- `<name>.json`——清单：参数、sigmas、seed、cfg、提示词条件的结构、冻结时的模型，以及产生它的工作流。
+- `<name>.safetensors`——张量：冻结的状态、端点预测、latent 原始内容、noise mask 和条件。
+- `<name>.mp4`——草稿视频，用 `models/vae_approx` 里的预览 VAE 画出并缩放到目标分辨率。帧数和时长与成片一致。
+
+条件是**原样**冻结的：文本 embedding，以及 H3 存在条件里的参考图和参考音（已编码）。恢复时读回来，所以恢复图里不需要提示词，也不需要参考图——只需要模型、VAE 和采样器。
+
+草稿节点会回报东西放在哪儿：快照与草稿视频的路径写在运行历史该节点的 `snapshot` 和 `draft_video` 条目里，发任务的 Agent 直接就能拿到，不用猜。
+
+`workflows/h3-draft.api.json` 与 `workflows/h3-resume.api.json` 是两张 API 格式的图，可直接 `POST /prompt`：草稿图就是常用 H3 工作流把采样器换成草稿节点，恢复图只留模型链并指向一个快照。`workflows/H3 SelfLift Draft｜Freeze and Preview.json` 与 `workflows/H3 SelfLift Resume｜Continue from Snapshot.json` 是同样两张图的 UI 格式版本，由"H3 SelfLift Dual Sample"工作流派生：导入后先跑草稿，再把快照路径填进恢复节点。
+
 ## H3 Temporal State Transport (TST)
 
 `MODEL` → `MODEL` 补丁节点，推理时改善 H3 视频的时间稳定性——免训练、免额外模型，运行开销约 1–2%。主要对付：帧间闪烁或变形的小细节（logo、画面文字、纹理）、人物与服装的身份漂移、不符合物理的运动。可配合任意标准采样节点，不限于 SelfLift 采样器。它不能凭空生成模型没有的细节。
