@@ -34,30 +34,27 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 
 从 [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载，放入 `ComfyUI/models/latent_upscale_models/` 后重启。节点默认选第一个文件名含 `h3` 的模型，找不到则为 `none`(nearest 提升）。
 
-## 草稿与恢复（MiniMax H3）
+## 低分辨率草稿（MiniMax H3）
 
-两个节点把一次运行在分辨率过渡处切成两半：先用很低的代价试想法，批准后再从同一个状态接着做完。
+`SelfLiftH3Draft` 只跑一次运行里的低分辨率前缀就停下，把那份低分辨率 latent 交出来。接上你现成的解码链（`VAEDecode` + `VAEDecodeAudio` → `CreateVideo` → `SaveVideo`），就得到一份几秒钟的预览。
 
 | 节点 | 作用 |
 | --- | --- |
-| `SelfLiftH3Draft` | 只跑低分辨率前缀，用快速预览 VAE 画出一份草稿视频，并把这次运行冻结成快照：采样器状态、端点预测、提示词条件、sigma 调度、参数，以及产生它的工作流 |
-| `SelfLiftH3Resume` | 读回快照，把它提升到目标分辨率并跑完剩下的调度 |
+| `SelfLiftH3Sampler` | 完整运行：低分辨率前缀 → 提升到目标分辨率 → 跑完剩余调度 |
+| `SelfLiftH3Draft` | 只跑低分辨率前缀，输出低分辨率 latent |
 
-草稿只花 `transition_step` 次去噪评估（`lowres_scale` 分辨率下），恢复花掉剩下的部分。两者合起来的结果与一次完整运行**逐位相同**——草稿和恢复就是同一次运行的两半。
+**同一条轨迹，不是另一个样本。** 用与完整运行相同的 seed、提示词、参考图和 `transition_step` 跑草稿，得到的正是完整运行**一开始的那一段**：完整运行接下来做的，就是把它提升到目标分辨率、重新加噪、继续跑完。所以草稿里的构图、主体、动态走向就是成片的走向。
 
-草稿节点有一个可选输入 `audio_vae`。接上 H3 音频 VAE，草稿 mp4 就带上声景——那是模型在冻结那一刻对声景的估计，还很粗糙；成片的音频是一路去噪到底的结果，细节会和草稿不同。不接则草稿是静音的。音频 latent 无论如何都随快照一起冻结，所以最终成片一定有声音。
+两种用法，取决于 `transition_step`：
 
-快照写在 `output/selflift_drafts/`，每次草稿一组：
+- **与完整运行相同**（完整运行用 2，草稿也用 2）：草稿就是成片的开头，画面还带着不少噪声——省钱，但看不清。
+- **等于总步数**（4 步日程就填 4）：低分辨率把整条调度跑完，画面清晰可读，但这是**另一个样本**：同样 seed、同样提示词，可噪声落在更细的网格上，构图与成片不会逐帧相同。它能回答"提示词在这个尺度会不会崩"，不能预告成片画面。
 
-- `<name>.json`——清单：参数、sigmas、seed、cfg、提示词条件的结构、冻结时的模型，以及产生它的工作流。
-- `<name>.safetensors`——张量：冻结的状态、端点预测、latent 原始内容、noise mask 和条件。
-- `<name>.mp4`——草稿视频，用 `models/vae_approx` 里的预览 VAE 画出并缩放到目标分辨率。帧数和时长与成片一致。
+想两者兼得：把完整运行的 `transition_step` 调大，让内容在低分辨率上定得更完整，草稿沿用同一个值。
 
-条件是**原样**冻结的：文本 embedding，以及 H3 存在条件里的参考图和参考音（已编码）。恢复时读回来，所以恢复图里不需要提示词，也不需要参考图——只需要模型、VAE 和采样器。
+**参考复原要对齐。** keep-region 锚点和 noise mask 会自动插值到前缀网格；参考图本身用 `ref_image_size='match'` 缩到当前生成分辨率。草稿和完整运行必须用同一套参考设置，否则草稿的构图不代表成片。
 
-草稿节点会回报东西放在哪儿：快照与草稿视频的路径写在运行历史该节点的 `snapshot` 和 `draft_video` 条目里，发任务的 Agent 直接就能拿到，不用猜。
-
-`workflows/h3-draft.api.json` 与 `workflows/h3-resume.api.json` 是两张 API 格式的图，可直接 `POST /prompt`：草稿图就是常用 H3 工作流把采样器换成草稿节点，恢复图只留模型链并指向一个快照。`workflows/H3 SelfLift Draft｜Freeze and Preview.json` 与 `workflows/H3 SelfLift Resume｜Continue from Snapshot.json` 是同样两张图的 UI 格式版本，由"H3 SelfLift Dual Sample"工作流派生：导入后先跑草稿，再把快照路径填进恢复节点。
+`workflows/h3-draft.api.json` 是 API 格式的草稿图，可直接 `POST /prompt`。`workflows/H3 SelfLift Preview｜Low-res Draft.json` 是 UI 格式版本，由"H3 SelfLift Dual Sample"工作流派生，多了一条草稿分支和它自己的解码/保存尾巴。
 
 ## H3 Temporal State Transport (TST)
 

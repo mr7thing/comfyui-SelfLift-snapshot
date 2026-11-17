@@ -181,16 +181,42 @@
       "seed": 684655983592117,
       "cfg": 1.0,
       "transition_step": 5,
-      "lowres_scale": 0.4,
-      "rho": 0.6,
-      "w_min": 0.5,
-      "w_max": 1.0,
-      "upscaler_model": "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
-      "audio_vae": ["184", 0],
-      "highres_tiling": true,
-      "upscaler_unload": true,
-      "snapshot_name": "h3-draft",
-      "draft_video": true
+      "lowres_scale": 0.4
+    }
+  },
+  "901": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["171", 0],
+      "vae": ["215", 0]
+    }
+  },
+  "902": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {
+      "samples": ["171", 0],
+      "vae": ["184", 0]
+    }
+  },
+  "903": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["901", 0],
+      "audio": ["902", 0],
+      "fps": 25.0,
+      "bit_depth": 8,
+      "color_space": "sRGB",
+      "chroma_subsampling": "auto",
+      "codec": "none"
+    }
+  },
+  "904": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["903", 0],
+      "filename_prefix": "video/draft",
+      "format": "auto",
+      "codec": "auto"
     }
   }
 }

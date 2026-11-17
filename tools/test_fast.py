@@ -15,7 +15,7 @@ This runs the graph on a second ComfyUI, so the running instance is never
 touched, and prints the per-stage timing the node logs.
 
 Run with the ComfyUI interpreter:
-  ComfyUI/.venv/Scripts/python.exe tools/test_fast.py [fast|base]
+  ComfyUI/.venv/Scripts/python.exe tools/test_fast.py [fast|draft|preview|base]
 """
 import json
 import os
@@ -94,13 +94,19 @@ def build_graph(variant):
     for node_id, name in (("332", images[0]), ("333", images[1])):
         graph[node_id]["inputs"]["image"] = name.split(" [")[0]
 
-    # The full sampler: the draft node is only the low-resolution prefix.
+    # One graph, two front-ends: the draft is only the low-resolution prefix,
+    # the sampler lifts that prefix and finishes the clip.
     sampler = graph["171"]
-    sampler["class_type"] = "SelfLiftH3Sampler"
-    sampler["inputs"]["vae"] = ["215", 0]
-    sampler["inputs"].pop("audio_vae", None)
-    sampler["inputs"].pop("snapshot_name", None)
-    sampler["inputs"].pop("draft_video", None)
+    if variant == "draft":
+        sampler["class_type"] = "SelfLiftH3Draft"
+    else:
+        sampler["class_type"] = "SelfLiftH3Sampler"
+        sampler["inputs"]["vae"] = ["215", 0]
+        sampler["inputs"].update({
+            "rho": 0.6, "w_min": 0.5, "w_max": 1.0,
+            "upscaler_model": "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
+            "highres_tiling": True, "upscaler_unload": True,
+        })
 
     # The video tail: the sampler feeds the decoder the way the user's graph does.
     graph["901"] = {"class_type": "VAEDecode",
@@ -115,7 +121,7 @@ def build_graph(variant):
                     "inputs": {"video": ["903", 0], "filename_prefix": f"video/{variant}",
                                "format": "auto", "codec": "auto"}}
 
-    if variant in ("fast", "preview"):
+    if variant in ("fast", "preview", "draft"):
         # 1. the distilled four-step model
         graph["254"]["inputs"]["unet_name"] = "PRISM_DMAD_PDMD_w6a8_g32.safetensors"
         graph.pop("255", None)                       # the turbo LoRA belongs to the base model
@@ -124,7 +130,6 @@ def build_graph(variant):
         graph["223"]["inputs"]["steps"] = 4
         graph.pop("224", None)
         sampler["inputs"]["sigmas"] = ["223", 0]
-        sampler["inputs"]["transition_step"] = 2
         # 3. references sized to the generation instead of the 2048px pipeline
         graph["136"]["inputs"]["ref_image_size"] = "match"
         # 4. one preview frame instead of the whole clip
@@ -135,6 +140,15 @@ def build_graph(variant):
         graph["328"]["inputs"]["selection.keep_percent"] = 10
         # 6. the pytorch attention backend
         graph["256"]["inputs"]["attention"] = "pytorch attention"
+
+    if variant in ("fast", "preview"):
+        # The full sampler: two of the four steps run at the low resolution.
+        sampler["inputs"]["transition_step"] = 2
+
+    if variant == "draft":
+        # The draft: three of the four steps at the low resolution, so the
+        # preview is the readable part of the schedule rather than its noise.
+        sampler["inputs"]["transition_step"] = 3
 
     if variant == "preview":
         # The whole run on a quarter of the canvas: 0.16 MP instead of 0.4 MP.
@@ -194,6 +208,7 @@ def main():
     try:
         info = get(SERVER, "/object_info")
         assert "SelfLiftH3Sampler" in info, "the sampler node is not registered"
+        assert "SelfLiftH3Draft" in info, "the draft node is not registered"
         say(f"=== the {variant} graph ===")
         started = time.time()
         try:
