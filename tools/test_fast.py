@@ -115,7 +115,7 @@ def build_graph(variant):
                     "inputs": {"video": ["903", 0], "filename_prefix": f"video/{variant}",
                                "format": "auto", "codec": "auto"}}
 
-    if variant == "fast":
+    if variant in ("fast", "preview"):
         # 1. the distilled four-step model
         graph["254"]["inputs"]["unet_name"] = "PRISM_DMAD_PDMD_w6a8_g32.safetensors"
         graph.pop("255", None)                       # the turbo LoRA belongs to the base model
@@ -135,6 +135,11 @@ def build_graph(variant):
         graph["328"]["inputs"]["selection.keep_percent"] = 10
         # 6. the pytorch attention backend
         graph["256"]["inputs"]["attention"] = "pytorch attention"
+
+    if variant == "preview":
+        # The whole run on a quarter of the canvas: 0.16 MP instead of 0.4 MP.
+        graph["115"]["inputs"]["megapixels"] = 0.16
+        sampler["inputs"]["lowres_scale"] = 0.5
     return graph
 
 
