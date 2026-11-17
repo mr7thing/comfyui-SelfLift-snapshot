@@ -97,7 +97,7 @@ def build_graph(variant):
     # One graph, two front-ends: the draft is only the low-resolution prefix,
     # the sampler lifts that prefix and finishes the clip.
     sampler = graph["171"]
-    if variant == "draft":
+    if variant in ("draft", "draftfull"):
         sampler["class_type"] = "SelfLiftH3Draft"
     else:
         sampler["class_type"] = "SelfLiftH3Sampler"
@@ -121,7 +121,7 @@ def build_graph(variant):
                     "inputs": {"video": ["903", 0], "filename_prefix": f"video/{variant}",
                                "format": "auto", "codec": "auto"}}
 
-    if variant in ("fast", "preview", "draft"):
+    if variant in ("fast", "preview", "draft", "draftfull"):
         # 1. the distilled four-step model
         graph["254"]["inputs"]["unet_name"] = "PRISM_DMAD_PDMD_w6a8_g32.safetensors"
         graph.pop("255", None)                       # the turbo LoRA belongs to the base model
@@ -149,6 +149,11 @@ def build_graph(variant):
         # The draft: three of the four steps at the low resolution, so the
         # preview is the readable part of the schedule rather than its noise.
         sampler["inputs"]["transition_step"] = 3
+
+    if variant == "draftfull":
+        # The draft with the whole schedule on the low-resolution grid: a
+        # readable preview that is a second sample rather than the prefix.
+        sampler["inputs"]["transition_step"] = 4
 
     if variant == "preview":
         # The whole run on a quarter of the canvas: 0.16 MP instead of 0.4 MP.
