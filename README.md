@@ -48,11 +48,11 @@ Download from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH
 Two ways to use it, depending on `transition_step`:
 
 - **The same value the full run uses** (full run 2, draft 2): the draft is the opening of the clip, still carrying a lot of noise — cheap, but hard to read.
-- **The whole step count** (4 in a four-step schedule): the low-resolution grid runs the entire schedule and the result is readable, but it is **a different sample**: same seed, same prompt, yet the noise lands on a finer grid, so it is not frame-for-frame the finished clip. It answers "does the prompt fall apart at this scale", not "what will the clip look like".
+- **The whole step count** (4 in a four-step schedule): the low-resolution grid runs the entire schedule and the result is readable, with the framing of the finished clip but not its pixels — two resolutions on one trajectory, not two samples.
 
 For both at once: raise the full run's `transition_step` so more of the content is settled at low resolution, and give the draft the same value.
 
-**The references have to line up.** The keep-region anchor and the noise mask are interpolated onto the prefix grid automatically; the reference images themselves follow `ref_image_size='match'`, which scales them to the current generation resolution. The draft and the full run must use the same reference setup, or the draft's composition says nothing about the clip.
+**The references line up.** The keep-region anchor and the noise mask are interpolated onto the prefix grid automatically; the reference images themselves follow `ref_image_size='match'`, which scales them to the current generation resolution. Measured against each other, the `'match'` and the `'max'` encodings give nearly the same picture, so this is not the sensitive part; what matters is that **the draft and the full run use the same reference setup**, and that the draft lands on the same grid as the prefix (same grid plus same seed means the same noise means the same trajectory).
 
 `workflows/h3-draft.api.json` is the draft graph in the API format, ready for `POST /prompt`. `workflows/H3 SelfLift Preview｜Low-res Draft.json` is the same graph in the UI format, derived from the "H3 SelfLift Dual Sample" workflow with a draft branch and its own decode-and-save tail added.
 
