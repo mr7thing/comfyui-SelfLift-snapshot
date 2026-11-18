@@ -121,7 +121,8 @@ def build_graph(variant):
                     "inputs": {"video": ["903", 0], "filename_prefix": f"video/{variant}",
                                "format": "auto", "codec": "auto"}}
 
-    if variant in ("fast", "preview", "draft", "draftfull", "gridprefix", "gridprefixmatch"):
+    if variant in ("fast", "preview", "draft", "draftfull", "gridprefix", "gridprefixmatch",
+                   "split_3_1", "split_4_2", "split_5_1", "split_2_2"):
         # 1. the distilled four-step model
         graph["254"]["inputs"]["unet_name"] = "PRISM_DMAD_PDMD_w6a8_g32.safetensors"
         graph.pop("255", None)                       # the turbo LoRA belongs to the base model
@@ -140,6 +141,17 @@ def build_graph(variant):
         graph["328"]["inputs"]["selection.keep_percent"] = 10
         # 6. the pytorch attention backend
         graph["256"]["inputs"]["attention"] = "pytorch attention"
+
+    if variant in ("split_2_2", "split_3_1"):
+        # Four steps in total, split between the low-resolution prefix and the
+        # high-resolution continuation after the lift.
+        graph["223"]["inputs"]["steps"] = 4
+        sampler["inputs"]["transition_step"] = 2 if variant == "split_2_2" else 3
+
+    if variant in ("split_4_2", "split_5_1"):
+        # Six steps in total: four or five of them at the low resolution.
+        graph["223"]["inputs"]["steps"] = 6
+        sampler["inputs"]["transition_step"] = 4 if variant == "split_4_2" else 5
 
     if variant in ("fast", "preview"):
         # The full sampler: two of the four steps run at the low resolution.
