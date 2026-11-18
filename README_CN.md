@@ -183,6 +183,17 @@ SelfLift 决定**怎么采**。两边真正共享的只有一样东西：条件�
 现成的工作流在 `workflows/H3 Studio x SelfLift Draft Mode.json`；
 `tools/make_h3studio_workflow.py` 可以重新生成它，并把模型名换成本机实际有的那些。
 
+另外还带两份示范图，都从同一次真实运行改出来 —— 一间地板铺满粉色花瓣的花房间，
+花瓣做的人形躺在上面：
+
+- `workflows/Petal Room - SelfLift Draft Mode.json` —— 同样的内容，走原生 MiniMax guide：
+  一张参考图，提示词让花瓣洒落、聚成图中那个人形。画布 544x800，跟图片同比例。
+- `workflows/Petal Room - H3 Studio x SelfLift.json` —— 同一张图、同一个提示词，换成 H3 Studio 的 guide。
+  图片接到 `first_frame`、强度 0.65，于是 H3 Studio 交给采样器的是一个**被弱化的关键帧**：
+  低分辨率前缀必须把它缩到自己的网格上，日志里那句「噪声被补回来了」就是协作路径在干活。
+
+`tools/make_petal_workflows.py` 可以重新生成这两份。
+
 草稿采样器为 H3 Studio 额外做的几件事（原 `SelfLiftH3Sampler` 一个字节没动）：
 
 - **关键帧的噪声被补回来。** H3 Studio 用 `z' = a·z + (1-a)·noise` 弱化关键帧，

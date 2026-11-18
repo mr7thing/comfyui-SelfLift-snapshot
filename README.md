@@ -154,6 +154,13 @@ Limitations: MiniMax H3 models only (other models are skipped silently); **not c
 
 A ready-made graph ships in `workflows/H3 Studio x SelfLift Draft Mode.json`; `tools/make_h3studio_workflow.py` regenerates it and swaps in the model names actually present on this machine.
 
+Two more graphs ship as worked examples, both cut from one real run: a flower room whose floor is carpeted in pink petals, with a woman made of petals lying on it.
+
+- `workflows/Petal Room - SelfLift Draft Mode.json` — the same content on the stock MiniMax guide. One reference picture, and a prompt that asks for the petals to rain down and to gather into the person of that picture. The canvas is 544x800, the shape of the picture.
+- `workflows/Petal Room - H3 Studio x SelfLift.json` — the same picture and the same prompt, with H3 Studio's guide in it. The picture is wired to `first_frame` at strength 0.65, so H3 Studio hands the sampler a *weakened keyframe*: the low-resolution prefix has to resize that keyframe onto its own grid, and the log line saying the noise was put back is the cooperation path doing its work.
+
+`tools/make_petal_workflows.py` regenerates both.
+
 What the draft sampler adds for H3 Studio (the plain `SelfLiftH3Sampler` is untouched, byte for byte):
 
 - **Keyframe noise is put back.** H3 Studio weakens a keyframe by blending noise into it (`z' = a·z + (1-a)·noise`) and keeps `a` in the condition as `noise_aug`. Averaging that keyframe down to the low-resolution grid averages its noise away with it, so the draft sampler resamples by area rather than bilinear and adds the missing noise back in, scaled by `1-noise_aug`. Every keyframe is area-resampled — area is the correct filter for downscaling and bilinear aliases — but a keyframe with no `noise_aug` gets no noise added, because its strength is not knowable and guessing would damage it.
