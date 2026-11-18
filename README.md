@@ -30,24 +30,37 @@ Experimental H3 audio-video adaptation (not paper-validated). Two modes:
 
 Extra inputs: `upscaler_model`, `upscaler_unload` (default on: unloads the upscaler from VRAM right after the lift, before the high-resolution stage) and `highres_tiling` (experimental: splits the high-res phase into 1–8 spatial tiles to save VRAM; only the first tile's audio is kept, there is no cross-tile attention, ControlNet is unsupported, and quality/speed may change).
 
+### What the H3 sampler hands back
+
+Besides the latent, the H3 sampler writes two files of its own into `output/selflift/` and returns their paths:
+
+| Output | File | What it is |
+| --- | --- | --- |
+| `preview_video` | `run_<name>_<time>.mp4` | The finished clip drawn with the fast decoder from `models/vae_approx` (`preview_vae`, `taeh3` for H3). A quick look, not the deliverable: the real VAE still decodes the latent you connect. Connect `audio_vae` and it carries the soundscape too. |
+| `workflow_json` | `run_<name>_<time>.json` | The run as it was: the parameters, the API graph and the UI graph it came from. Enough to repeat the run or to see afterwards what was asked for. |
+
+`preview_video` (default on) and `fps` (default 25) control the preview; `run_name` names both files.
+
 ### Optional H3 upscaler
 
 Download from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) into `ComfyUI/models/latent_upscale_models/` and restart. The node selects the first filename containing `h3`, otherwise `none` (nearest-neighbor lift).
 
 ## Low-resolution draft (MiniMax H3)
 
-`SelfLiftH3Draft` runs the low-resolution prefix of a run and stops there, handing back that low-resolution latent. Feed it into the decode chain you already have (`VAEDecode` + `VAEDecodeAudio` → `CreateVideo` → `SaveVideo`) and you get a preview clip in seconds.
+`SelfLiftH3Draft` runs the low-resolution prefix of a run and stops there. It hands back that low-resolution latent and, with `preview_video` on, draws it with the small decoder in `models/vae_approx` (`taeh3`) and writes an mp4 to `output/selflift_drafts/`. The preview keeps the prefix's own resolution: nothing is scaled up, because a scaled-up preview only invents detail the prefix never had. Connect `audio_vae` and the preview carries the soundscape too.
 
 | Node | What it does |
 | --- | --- |
 | `SelfLiftH3Sampler` | The full run: low-resolution prefix → lift to the target resolution → finish the schedule. |
-| `SelfLiftH3Draft` | Runs the low-resolution prefix only and returns the low-resolution latent. |
+| `SelfLiftH3Draft` | Runs the low-resolution prefix only, returns the low-resolution latent and writes the preview mp4. |
+
+**The preview is as big as the prefix, not as big as the target.** Its pixel count is `target megapixels × lowres_scale`, decoded as it is. That is the whole sizing question: raising `lowres_scale` makes the preview bigger and leaves the finished clip alone, while raising the target makes both bigger — every high-resolution step and the lift's VAE round trip scale with the target's area.
 
 **The same trajectory, not a second sample.** With the same seed, prompt, reference setup and `transition_step` as the full run, the draft is literally the first stretch of that run: what the full run does next is lift the prefix to the target resolution, re-noise it and finish the schedule. The composition, the subject and the movement in the draft are the ones the finished clip grows out of.
 
 Two ways to use it, depending on `transition_step`:
 
-- **The same value the full run uses** (full run 2, draft 2): the draft is the opening of the clip, still carrying a lot of noise — cheap, but hard to read.
+- **The same value the full run uses** (full run 5, draft 5): the draft is the opening of the clip, still carrying a lot of noise — cheap, but hard to read.
 - **The whole step count** (4 in a four-step schedule): the low-resolution grid runs the entire schedule and the result is readable, with the framing of the finished clip but not its pixels — two resolutions on one trajectory, not two samples.
 
 For both at once: raise the full run's `transition_step` so more of the content is settled at low resolution, and give the draft the same value.

@@ -12,6 +12,7 @@ Two front-ends share the same engine:
 - SelfLiftImageSampler: compatible rectified-flow image models.
 """
 
+import json
 import logging
 import os
 import time
@@ -26,12 +27,14 @@ import comfy.nested_tensor
 import comfy.sample
 import comfy.samplers
 import comfy.utils
+import folder_paths
 import latent_preview
 
 from . import selflift
 from . import h3_upscaler
 from . import h3_tiling
 from . import h3_tst
+from . import h3_preview
 from .diagnostics import log_memory
 
 
@@ -72,6 +75,20 @@ def _upscaler_input():
     default = h3_models[0] if h3_models else "none"
     return (models, {"default": default,
                      "tooltip": "External H3 latent upscaler (models/latent_upscale_models). The first detected H3 model is selected by default; 'none' uses nearest-neighbor lifting."})
+
+
+def _default_preview_vae():
+    """The fast decoder a run draws its preview with when nothing else is asked for."""
+    models = h3_preview.list_preview_vaes()
+    return next((name for name in models if name.startswith(h3_preview.PREVIEW_VAE)),
+                models[0] if models else "none")
+
+
+def _preview_vae_input():
+    """The fast decoders in models/vae_approx, so a run can draw its own preview."""
+    models = ["none"] + h3_preview.list_preview_vaes()
+    return (models, {"default": _default_preview_vae(),
+                     "tooltip": "Fast decoder from models/vae_approx used to draw the preview mp4 (taeh3 for MiniMax H3). 'none' skips the preview."})
 
 
 def _streams(samples):
@@ -589,15 +606,25 @@ class SelfLiftH3Sampler:
             "model_hires": ("MODEL", {"tooltip": "Optional: model used for the high-resolution stage instead of `model` (e.g. a different checkpoint or LoRA stack). Must share the same architecture and latent format. The low-resolution prefix always runs on `model`."}),
             "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental: select 1–8 spatial tiles from available memory at high-resolution preparation. Audio input and references remain complete; only the first tile's audio prediction is retained. Quality and speed may change."}),
             "upscaler_unload": ("BOOLEAN", {"default": True, "label_on": "放大后卸载：开启", "label_off": "放大后卸载：关闭", "tooltip": "Unload the external H3 upscaler from VRAM right after the lift, before the high-resolution stage loads. Disable only if the upscaler is reused between runs and VRAM is not tight."}),
-        }}
+            "preview_vae": _preview_vae_input(),
+            "preview_video": ("BOOLEAN", {"default": True, "label_on": "预览视频：开启", "label_off": "预览视频：关闭", "tooltip": "Draw the finished clip with the fast preview decoder in models/vae_approx and write it as an mp4. It is a quick look, not the deliverable: the real VAE still decodes the latent you connect."}),
+            "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0, "step": 1.0, "tooltip": "Frame rate of the preview mp4. Match the frame rate of the finished clip so the two can be compared frame by frame."}),
+            "audio_vae": ("VAE", {"tooltip": "Optional: the H3 audio VAE. Connect it and the preview mp4 carries the soundscape too."}),
+            "run_name": ("STRING", {"default": "selflift", "tooltip": "Name for the files this run writes: the preview mp4 and the workflow JSON."}),
+        }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", "STRING", "STRING")
+    RETURN_NAMES = ("latent", "preview_video", "workflow_json")
     FUNCTION = "sample"
     CATEGORY = "selflift"
+    OUTPUT_NODE = True
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, model_hires=None, highres_tiling=False,
-               upscaler_unload=True):
+               upscaler_unload=True, preview_vae=None, preview_video=True, fps=25.0, audio_vae=None,
+               run_name="selflift", prompt=None, extra_pnginfo=None):
+        if preview_vae is None:
+            preview_vae = _default_preview_vae()
         if rho == 0.0 and upscaler_model == "none":
             raise ValueError(
                 "SelfLift H3: rho=0 with upscaler_model=none disables both SelfLift-zero correction "
@@ -608,9 +635,28 @@ class SelfLiftH3Sampler:
             if rho > 0.0 and w_max > 0.0:
                 logging.warning("SelfLift H3: rho > 0 with an external upscaler is a hybrid experiment; select upscaler_model=none to test the paper's SelfLift-zero direct route")
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=upscaler_unload)
-        return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
-                                   transition_step, lowres_scale, rho, w_min, w_max, "nearest",
-                                   latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires),)
+        result = progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
+                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
+                                    latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires)
+
+        params = {
+            "seed": seed, "cfg": cfg, "transition_step": transition_step, "lowres_scale": lowres_scale,
+            "rho": rho, "w_min": w_min, "w_max": w_max, "upscaler_model": upscaler_model,
+            "highres_tiling": highres_tiling, "upscaler_unload": upscaler_unload,
+            "preview_vae": preview_vae, "fps": fps, "steps": int(sigmas.numel() - 1),
+            "latent_shape": [list(stream.shape) for stream in _streams(result["samples"])[0]],
+        }
+        video_path = ""
+        json_path = ""
+        stem = _run_path("run", run_name or "selflift")
+        if preview_video:
+            latent_format = model.get_model_object("latent_format")
+            video_path = _draw_preview(stem + ".mp4", result["samples"], latent_format,
+                                       preview_vae, audio_vae, 1.0, fps) or ""
+        json_path = _workflow_json(stem + ".json", params, prompt, extra_pnginfo,
+                                   {"preview_video": video_path})
+        return {"ui": {"preview_video": [video_path], "workflow_json": [json_path]},
+                "result": (result, video_path, json_path)}
 
 
 class SelfLiftH3Draft:
@@ -625,6 +671,10 @@ class SelfLiftH3Draft:
 
     Set `transition_step` to the whole step count for a complete low-resolution
     sample instead: readable, but a different trajectory from a full run.
+
+    The preview is drawn with the small decoder in `models/vae_approx` (taeh3),
+    at the prefix's own resolution. Nothing is scaled up: the preview is what
+    the low-resolution prefix actually looks like, which is the point of it.
     """
 
     @classmethod
@@ -638,17 +688,27 @@ class SelfLiftH3Draft:
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
-            "transition_step": ("INT", {"default": 3, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. Use the full run's value to preview its prefix; use the whole step count for a complete low-resolution sample."}),
-            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix. Match the full run's value."}),
+            "transition_step": ("INT", {"default": 2, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. Use the full run's value to preview its prefix; use the whole step count for a complete low-resolution sample."}),
+            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix. It sets the preview's resolution: the preview is this fraction of the target, and its sampling cost follows its own area, not the target's."}),
+            "preview_video": ("BOOLEAN", {"default": True, "label_on": "预览视频：开启", "label_off": "预览视频：关闭", "tooltip": "Draw the prefix with the fast preview decoder in models/vae_approx and write it as an mp4 at the prefix's own resolution. No scaling: the preview stays as small as the prefix is."}),
+        }, "optional": {
+            "preview_vae": _preview_vae_input(),
+            "preview_video": ("BOOLEAN", {"default": True, "label_on": "预览视频：开启", "label_off": "预览视频：关闭", "tooltip": "Draw the prefix with the fast preview decoder in models/vae_approx and write it as an mp4 at the prefix's own resolution. No scaling: the preview stays as small as the prefix is."}),
+            "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0, "step": 1.0, "tooltip": "Frame rate of the preview mp4. Match the frame rate of the full run so the two can be compared frame by frame."}),
+            "audio_vae": ("VAE", {"tooltip": "Optional: the H3 audio VAE. Connect it and the preview mp4 carries the soundscape the model had at the end of the prefix."}),
         }}
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("draft_latent",)
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("draft_latent", "preview_video")
     FUNCTION = "sample"
     CATEGORY = "selflift"
+    OUTPUT_NODE = True
 
     def sample(self, model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
-               transition_step, lowres_scale):
+               transition_step, lowres_scale, preview_vae=None, preview_video=True, fps=25.0,
+               audio_vae=None):
+        if preview_vae is None:
+            preview_vae = _default_preview_vae()
         run = _setup_run(model, positive, negative, None, latent_image, sampler, sigmas, seed, cfg,
                          transition_step, lowres_scale, 0.0, 0.0, 0.0, "nearest", draft=True)
         frozen = _run_low_stage(run)
@@ -657,7 +717,109 @@ class SelfLiftH3Draft:
         if "batch_index" in latent_image:
             draft["batch_index"] = latent_image["batch_index"]
         logging.info("[SelfLift draft] low-resolution latent %s", tuple(draft["samples"].shape))
-        return (draft,)
+        path = ""
+        if preview_video:
+            path = _write_preview_video(run, frozen["x0"], preview_vae, audio_vae, fps) or ""
+        return {"ui": {"preview_video": [path]},
+                "result": (draft, path)}
+
+
+def _audio_scale(run):
+    """The factor the sampler carries the audio stream at (H3: shift / audio_shift).
+
+    The sampler works on the audio stream scaled onto the video schedule, so a
+    frozen endpoint has to be brought back to the audio VAE's own scale before
+    it can be decoded.
+    """
+    scale = getattr(run["model_sampling"], "audio_scale", None)
+    if scale is not None:
+        return float(scale)
+    getter = getattr(run["model"].model, "audio_scale", None)
+    if getter is not None:
+        return float(getter())
+    return 1.0
+
+
+def _write_preview_video(run, x0, preview_vae, audio_vae=None, fps=25.0):
+    """Draw the low-resolution prefix with the fast preview decoder.
+
+    The frames keep the prefix's own resolution: scaling them up to the target
+    would only invent detail the prefix never had.
+    """
+    return _draw_preview(_run_path("draft"), x0, run["latent_format"], preview_vae,
+                          audio_vae, _audio_scale(run), fps)
+
+
+def _draw_preview(path, samples, latent_format, preview_vae, audio_vae=None, audio_scale=1.0, fps=25.0):
+    """Draw a latent with the fast preview decoder and write it as an mp4.
+
+    The frames keep the resolution the latent carries: scaling them up would
+    only invent detail the run never had.
+
+    Args:
+        path: Where the mp4 goes.
+        samples: The latent to draw -- the video stream and, for H3, the audio.
+        latent_format: The model's latent format, for `process_out`.
+        preview_vae: The fast decoder's file name, or 'none'.
+        audio_vae: The H3 audio VAE, for the soundtrack.
+        audio_scale: The scale the sampler carries the audio stream at.
+        fps: The frame rate of the mp4.
+
+    Returns:
+        The path, or ``None`` where there is no preview to draw.
+    """
+    if preview_vae == "none":
+        return None
+    vae = h3_preview.preview_vae(preview_vae)
+    if vae is None:
+        return None
+    streams, nested = _streams(samples)
+    latent = latent_format.process_out(streams[0].float())
+    frames = h3_preview.decode_frames(vae, latent)
+    audio = None
+    sample_rate = 32000
+    if audio_vae is not None and nested and len(streams) > 1:
+        audio_latent = streams[1].float()
+        if audio_scale != 1.0:
+            audio_latent = audio_latent / audio_scale
+        waveform, sample_rate = h3_preview.decode_audio(audio_vae, audio_latent)
+        audio = waveform[0].detach().float().cpu()
+    h3_preview.write_video(frames, path, fps=fps, audio=audio, audio_sample_rate=sample_rate)
+    logging.info("[SelfLift] preview %s at %dx%d", path, frames.shape[2], frames.shape[1])
+    return path
+
+
+def _run_folder():
+    """Where the runs keep the files they write themselves."""
+    folder = os.path.join(folder_paths.get_output_directory(), "selflift")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _run_path(prefix, name=""):
+    """A file name for one run's own output: the name and the time."""
+    stem = prefix + ("_" + name if name else "") + "_" + time.strftime("%Y%m%d-%H%M%S")
+    return os.path.join(_run_folder(), stem)
+
+
+def _workflow_json(path, params, prompt=None, extra_pnginfo=None, outputs=None):
+    """Save a run as a JSON file: what it was, and the graph that made it.
+
+    The API graph comes from the run itself and the UI graph from the
+    extra data ComfyUI passes along, so the file is enough to repeat the run
+    or to see afterwards what was asked for.
+    """
+    payload = {
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "params": params,
+        "prompt": prompt or {},
+        "workflow": (extra_pnginfo or {}).get("workflow", {}),
+        "outputs": outputs or {},
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=1)
+    logging.info("[SelfLift] workflow %s", path)
+    return path
 
 
 class SelfLiftImageSampler:

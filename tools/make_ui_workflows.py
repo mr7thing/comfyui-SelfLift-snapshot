@@ -28,6 +28,7 @@ OUT = os.path.join(REPO, "workflows")
 SAMPLER = 171
 PREVIEW = 153
 SAVE_VIDEO = 274
+AUDIO_VAE = 184
 
 
 def node_of(workflow, node_id):
@@ -72,6 +73,16 @@ def retarget(workflow, link_id, slot):
     raise KeyError(f"no link {link_id}")
 
 
+def add_link(workflow, link_id, origin_id, origin_slot, target_id, target_slot, kind):
+    """Add a link and register it on both of its ends."""
+    workflow["links"].append([link_id, origin_id, origin_slot, target_id, target_slot, kind])
+    origin = node_of(workflow, origin_id)
+    links = origin["outputs"][origin_slot].setdefault("links", [])
+    links.append(link_id)
+    target = node_of(workflow, target_id)
+    target["inputs"][target_slot]["link"] = link_id
+
+
 def build_preview(source):
     workflow = copy.deepcopy(source)
     workflow["id"] = str(uuid.uuid4())
@@ -82,6 +93,9 @@ def build_preview(source):
     retarget(workflow, 348, 3)
     retarget(workflow, 349, 4)
     retarget(workflow, 410, 5)
+    for link in list(workflow["links"]):
+        if link[3] == SAMPLER and link[1] == AUDIO_VAE:
+            drop_link(workflow, link[0])   # the draft gets its own audio VAE link
 
     sampler = node_of(workflow, SAMPLER)
     sampler["type"] = "SelfLiftH3Draft"
@@ -97,13 +111,27 @@ def build_preview(source):
         entry("cfg", "FLOAT", widget=True),
         entry("transition_step", "INT", widget=True),
         entry("lowres_scale", "FLOAT", widget=True),
+        entry("preview_vae", "COMBO", widget=True),
+        entry("preview_video", "BOOLEAN", widget=True),
+        entry("fps", "FLOAT", widget=True),
+        entry("audio_vae", "VAE", shape=7),
     ]
     # The seed stays put, so the preview and the finished clip are one run.
-    sampler["widgets_values"] = [684655983592117, "fixed", 1, 5, 0.4]
+    sampler["widgets_values"] = [684655983592117, "fixed", 1, 2, 0.4,
+                                 "taeh3.safetensors", True, 25.0]
     sampler["widgets_values_named"] = {
         "seed": 684655983592117, "control_after_generate": "fixed",
-        "cfg": 1, "transition_step": 5, "lowres_scale": 0.4,
+        "cfg": 1, "transition_step": 2, "lowres_scale": 0.4,
+        "preview_vae": "taeh3.safetensors", "preview_video": True, "fps": 25.0,
     }
+    sampler["outputs"] = [sampler["outputs"][0]]
+    sampler["outputs"].append({
+        "label": "preview_video", "localized_name": "preview_video",
+        "name": "preview_video", "type": "STRING", "links": None,
+    })
+    # The draft's own mp4 carries the soundscape: the audio VAE comes along.
+    add_link(workflow, max(link[0] for link in workflow["links"]) + 1,
+             AUDIO_VAE, 0, SAMPLER, 13, "VAE")
 
     # One preview frame per step: the step preview decodes the whole clip otherwise.
     preview = node_of(workflow, PREVIEW)

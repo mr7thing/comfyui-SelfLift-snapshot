@@ -1,5 +1,5 @@
 {
-  "id": "552ca2a3-aa80-4fa6-bbf5-af38631cc202",
+  "id": "deea384b-5422-452d-b7c7-474a120c7526",
   "revision": 0,
   "last_node_id": 333,
   "last_link_id": 553,
@@ -904,6 +904,44 @@
             "name": "lowres_scale"
           },
           "link": null
+        },
+        {
+          "label": "preview_vae",
+          "localized_name": "preview_vae",
+          "name": "preview_vae",
+          "type": "COMBO",
+          "widget": {
+            "name": "preview_vae"
+          },
+          "link": null
+        },
+        {
+          "label": "preview_video",
+          "localized_name": "preview_video",
+          "name": "preview_video",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "preview_video"
+          },
+          "link": null
+        },
+        {
+          "label": "fps",
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "label": "audio_vae",
+          "localized_name": "audio_vae",
+          "name": "audio_vae",
+          "type": "VAE",
+          "shape": 7,
+          "link": 554
         }
       ],
       "outputs": [
@@ -916,6 +954,13 @@
             351,
             353
           ]
+        },
+        {
+          "label": "preview_video",
+          "localized_name": "preview_video",
+          "name": "preview_video",
+          "type": "STRING",
+          "links": null
         }
       ],
       "properties": {
@@ -928,15 +973,21 @@
         684655983592117,
         "fixed",
         1,
-        5,
-        0.4
+        2,
+        0.4,
+        "taeh3.safetensors",
+        true,
+        25.0
       ],
       "widgets_values_named": {
         "seed": 684655983592117,
         "control_after_generate": "fixed",
         "cfg": 1,
-        "transition_step": 5,
-        "lowres_scale": 0.4
+        "transition_step": 2,
+        "lowres_scale": 0.4,
+        "preview_vae": "taeh3.safetensors",
+        "preview_video": true,
+        "fps": 25.0
       },
       "color": "#323",
       "bgcolor": "#535"
@@ -1041,7 +1092,8 @@
           "type": "VAE",
           "links": [
             368,
-            369
+            369,
+            554
           ]
         }
       ],
@@ -2813,6 +2865,14 @@
       328,
       0,
       "MODEL"
+    ],
+    [
+      554,
+      184,
+      0,
+      171,
+      13,
+      "VAE"
     ]
   ],
   "groups": [

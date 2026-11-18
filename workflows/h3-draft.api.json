@@ -181,7 +181,11 @@
       "seed": 684655983592117,
       "cfg": 1.0,
       "transition_step": 5,
-      "lowres_scale": 0.4
+      "lowres_scale": 0.4,
+      "preview_vae": "taeh3.safetensors",
+      "preview_video": true,
+      "fps": 25.0,
+      "audio_vae": ["184", 0]
     }
   },
   "901": {

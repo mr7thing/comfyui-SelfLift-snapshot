@@ -106,6 +106,8 @@ def build_graph(variant):
             "rho": 0.6, "w_min": 0.5, "w_max": 1.0,
             "upscaler_model": "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
             "highres_tiling": True, "upscaler_unload": True,
+            "preview_vae": "taeh3.safetensors", "audio_vae": ["184", 0],
+            "run_name": f"selflift_{variant}",
         })
 
     # The video tail: the sampler feeds the decoder the way the user's graph does.
