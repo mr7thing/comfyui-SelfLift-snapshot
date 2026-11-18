@@ -6,6 +6,54 @@ Progressive-resolution sampling for ComfyUI: run the early denoising steps at lo
 
 All nodes are in the `selflift` category. The samplers use `sampler`/`sigmas` inputs like `SamplerCustom`; connect the standard `euler` sampler from `KSamplerSelect` and the model's normal scheduler (other samplers are rejected).
 
+## What this branch changes
+
+Three things, in three separate places. `SelfLiftH3Sampler` and `SelfLiftImageSampler` are **byte-identical to the previous revision** — same inputs, same outputs, same numbers. Everything new lives on new nodes, or behind a switch that is off by default.
+
+### 1. A draft mode, on its own nodes
+
+`SelfLiftH3DraftSampler` gives the H3 sampler a `draft_mode` switch without touching the sampler. With it on, the run is a **draft**: only the low-resolution prefix is sampled — no lift, no high-resolution steps — and the latent does not travel on. The prefix is drawn with the fast decoder (`taeh3`), so the draft carries the soundscape too when `audio_vae` is connected. The node hands back the latent plus the three files the run produced: the preview mp4, the canvas workflow and the API prompt.
+
+`SelfLiftH3Save` files those three files away and decides what happens to the latent. A draft run: the files move into the folder and under the name it was given, and the latent is kept, so the decoders downstream stay quiet. A full run: the latent passes straight through and nothing is written.
+
+The switch lives on the sampler and the save node reads it from there, so the two cannot disagree about what the run was — one switch, not two. The operational details are in *Draft mode* below.
+
+### 2. What had to be adapted inside the sampler
+
+Three shared helpers grew one switch, `h3_studio_coop`, **defaulting to off**:
+
+| Helper | What the switch guards |
+| --- | --- |
+| `_setup_run` | the tiling/TST conflict check and the extra log lines, both inside `if h3_studio_coop:` |
+| `progressive_sample` | forwards the switch, nothing else |
+| `_resize_keyframes` | the keyframe resizing was refactored so the 5D and 4D branches share one interpolation call; with the switch off the result is bit-identical to before |
+
+The rest of the sampling chain — `_run_low_stage`, `_run_transition`, `_run_high_stage`, `_streams`, `_euler_step`, `_mask_blend_fn` and the validators — is untouched.
+
+Two smaller adaptations, both on the draft path only:
+
+- The preview is written into a staging folder and **moved** into place by the save node, so a half-written file is never filed.
+- The save node stops the downstream decoders with ComfyUI's `ExecutionBlocker` when the run is a draft. Without it the decoders would run on the preview latent and quietly produce a second, wrong video.
+
+### 3. What it does for H3 Studio
+
+[ComfyUI-H3Studio](https://github.com/mr7thing/ComfyUI-H3Studio) decides *what the model gets*; SelfLift decides *how it is sampled*. The two share exactly one thing: the conditioning dictionary. The draft sampler reads two keys out of it, both written by H3 Studio's guide node:
+
+| Key | What it is | What SelfLift does with it |
+| --- | --- | --- |
+| `minimax_keyframes` | the keyframe list | the low-resolution prefix has to resize the keyframes onto its own grid |
+| `minimax_keyframes[i]["noise_aug"]` | `= strength × 0.999` | how much noise the keyframe carries, and therefore how much has to be put back |
+
+**Keyframe noise is put back.** H3 Studio weakens a keyframe by blending noise into it (`z' = a·z + (1-a)·noise`) and keeps `a` in the condition as `noise_aug`. Averaging that keyframe down to the low-resolution grid averages its noise away with it — and bilinear, which is what the plain sampler uses, aliases the noise instead of averaging it, so the noise survives as a pattern rather than as noise. The draft sampler resamples by **area** (the correct filter for downscaling) and adds the missing noise back in, scaled by `1-noise_aug`, from a seed derived from the run's own seed, so the same run lands on the same noise. Measured offline on a keyframe at strength 0.65 (`noise_aug = 0.6493`, 35.1% noise): the per-axis standard deviation of the noise went from 0.2289 — *above* the 0.1200 a true average would give, which is what aliasing looks like — to 0.3479 against a target of 0.3507, 0.8% off. A keyframe with no `noise_aug` gets no noise added: its strength is not knowable, and guessing would damage it.
+
+**`highres_tiling` and TST are refused together.** The tiling wrapper sits inside TST's, so tiled attention never reaches the correction and TST would be skipped without a trace. The draft sampler raises instead of leaving it to a console warning.
+
+**A start below pure noise is called out.** When the schedule starts under sigma 1.0 the run begins from the source latent (v2v / img2img semantics), and the log says so.
+
+**Multi-frame keyframe blocks are called out.** Motion-context pins get downscaled together with everything else in the low-resolution prefix, so the join can be softer here than in a native H3 Studio run. The keyframe grid rule leaves no other option.
+
+The wiring table is in *Using it with H3 Studio* below; the contract on both sides is in [`COLLABORATION.md`](COLLABORATION.md).
+
 ## SelfLift Progressive Sampler (Image)
 
 The paper's SelfLift-zero for rectified-flow image backbones. Connect 4D image latents (e.g. *Empty Latent Image*) and the model's own VAE.

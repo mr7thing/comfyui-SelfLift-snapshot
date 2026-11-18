@@ -6,6 +6,80 @@ ComfyUI 渐进分辨率采样：前期去噪步骤跑低分辨率，把结果提
 
 全部节点位于 `selflift` 分类。采样器节点使用与 `SamplerCustom` 相同的 `sampler`/`sigmas` 接口；`KSamplerSelect` 必须选标准 `euler`，调度器沿用模型默认（其它采样器会被拒绝）。
 
+## 这个分支改了什么
+
+三件事，分散在三个地方。`SelfLiftH3Sampler` 和 `SelfLiftImageSampler`
+**与上一版逐字节一致** —— 输入一样、输出一致、数字不变。
+新增的东西要么在**新节点**上，要么在**默认关闭的开关**后面。
+
+### 1. 草稿模式，放在自己的节点里
+
+`SelfLiftH3DraftSampler` 给 H3 采样器加了一个 `draft_mode` 开关，而没有改动采样器本身。
+开着的时候，这次运行是**草稿**：只跑低分辨率前缀 —— 不放大、不跑高分辨率阶段 ——
+latent 也不再往下传。前缀用快速解码器（`taeh3`）画出来，所以接了 `audio_vae`
+的话草稿也带声音。节点交回 latent，外加这次运行产出的三个文件：预览 mp4、
+画布工作流、API prompt。
+
+`SelfLiftH3Save` 把那三个文件归档，并决定 latent 怎么办。草稿运行：文件搬进指定
+文件夹、按指定名字命名，latent 自己留着 —— 下游解码器因此不会出声。完整运行：
+latent 原样传下去，什么都不写。
+
+开关在采样器上，保存节点从那里读，两边不可能对「这次是不是草稿」有分歧 ——
+一个开关，不是两个。操作细节见下面的"草稿模式"。
+
+### 2. 采样器内部不得不做的适配
+
+三个共享函数多了一个开关 `h3_studio_coop`，**默认关闭**：
+
+| 函数 | 开关管住了什么 |
+| --- | --- |
+| `_setup_run` | tiling/TST 冲突检查和额外日志行，都在 `if h3_studio_coop:` 里面 |
+| `progressive_sample` | 只负责把开关往下传，别的什么都没做 |
+| `_resize_keyframes` | 关键帧缩放被重构过，让 5D 和 4D 两条分支共用一次插值调用；开关关着时结果与之前逐比特相同 |
+
+采样的其余环节 —— `_run_low_stage`、`_run_transition`、`_run_high_stage`、
+`_streams`、`_euler_step`、`_mask_blend_fn` 以及各个校验函数 —— 一个字没动。
+
+还有两处小适配，都只在草稿这条路上：
+
+- 预览先写进 staging 目录，再由保存节点**搬**到最终位置 —— 免得半截文件被归档。
+- 保存节点在草稿运行时用 ComfyUI 的 `ExecutionBlocker` 停掉下游解码器。
+  没有它，解码器会拿预览 latent 跑一遍，悄悄产出第二个、错误的视频。
+
+### 3. 对 H3 Studio 做了什么样的适应性改动
+
+[ComfyUI-H3Studio](https://github.com/mr7thing/ComfyUI-H3Studio) 决定**给模型什么**，
+SelfLift 决定**怎么采**。两边真正共享的只有一样东西：条件字典。
+草稿采样器从里面读两个键，都是 H3 Studio 的 guide 节点写的：
+
+| 键 | 是什么 | SelfLift 拿它做什么 |
+| --- | --- | --- |
+| `minimax_keyframes` | 关键帧列表 | 低分辨率前缀必须把关键帧缩到自己的网格上 |
+| `minimax_keyframes[i]["noise_aug"]` | `= strength × 0.999` | 关键帧带了多少噪声，也就有多少噪声要补回去 |
+
+**关键帧的噪声被补回来。** H3 Studio 用 `z' = a·z + (1-a)·noise` 弱化关键帧，
+并把 `a` 以 `noise_aug` 的形式留在条件里。把这个关键帧平均到低分辨率网格上时，
+噪声也跟着被平均掉了 —— 而原采样器用的双线性是**混叠**而不是平均，
+噪声于是以花纹的形式活了下来，不再是噪声。草稿采样器改用**面积采样**
+（缩小时的正确滤波器），再按 `1-noise_aug` 把缺的噪声补回去，
+补的种子由这次运行自己的 seed 派生，所以同一个 run 落在同一份噪声上。
+离线实测（strength 0.65 的关键帧，`noise_aug = 0.6493`，35.1% 是噪声）：
+噪声的每轴标准差从 0.2289 —— **高于**真平均该有的 0.1200，这正是混叠的样子 ——
+变成 0.3479，目标值 0.3507，偏差 0.8%。没有 `noise_aug` 的关键帧一分噪声都不补：
+它的强度不可知，瞎补会改坏它。
+
+**TST 和 `highres_tiling` 一起用会直接报错。** tiling 的 wrapper 坐在 TST 里面，
+分块 attention 永远到不了校正，TST 会被静默跳过。所以草稿采样器选择报错，
+而不是丢下一句控制台警告了事。
+
+**不是从纯噪声起步时会说明。** 调度表起点低于 sigma 1.0 时，这次运行是从源 latent
+部分去噪起步（v2v / 图生图语义），日志里会写清楚。
+
+**多帧关键帧块会说明。** motion context 钉住的帧和别的关键帧一起被降分辨率，
+所以这里的接缝可能不如原生 H3 Studio 流程干净。关键帧网格规则下没有别的选项。
+
+接线表见下面的"和 H3 Studio 一起用"；两边的完整契约见 [`COLLABORATION.md`](COLLABORATION.md)。
+
 ## SelfLift Progressive Sampler (Image)
 
 论文 SelfLift-zero，用于 rectified-flow 图像骨干。接入 4D 图像 latent（如 *Empty Latent Image*）和模型所属 VAE。
