@@ -185,7 +185,8 @@
       "preview_vae": "taeh3.safetensors",
       "preview_video": true,
       "fps": 25.0,
-      "audio_vae": ["184", 0]
+      "audio_vae": ["184", 0],
+      "run_name": "selflift"
     }
   },
   "901": {

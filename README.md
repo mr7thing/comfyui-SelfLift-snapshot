@@ -30,17 +30,6 @@ Experimental H3 audio-video adaptation (not paper-validated). Two modes:
 
 Extra inputs: `upscaler_model`, `upscaler_unload` (default on: unloads the upscaler from VRAM right after the lift, before the high-resolution stage) and `highres_tiling` (experimental: splits the high-res phase into 1–8 spatial tiles to save VRAM; only the first tile's audio is kept, there is no cross-tile attention, ControlNet is unsupported, and quality/speed may change).
 
-### What the H3 sampler hands back
-
-Besides the latent, the H3 sampler writes two files of its own into `output/selflift/` and returns their paths:
-
-| Output | File | What it is |
-| --- | --- | --- |
-| `preview_video` | `run_<name>_<time>.mp4` | The finished clip drawn with the fast decoder from `models/vae_approx` (`preview_vae`, `taeh3` for H3). A quick look, not the deliverable: the real VAE still decodes the latent you connect. Connect `audio_vae` and it carries the soundscape too. |
-| `workflow_json` | `run_<name>_<time>.json` | The run as it was: the parameters, the API graph and the UI graph it came from. Enough to repeat the run or to see afterwards what was asked for. |
-
-`preview_video` (default on) and `fps` (default 25) control the preview; `run_name` names both files.
-
 ### Optional H3 upscaler
 
 Download from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) into `ComfyUI/models/latent_upscale_models/` and restart. The node selects the first filename containing `h3`, otherwise `none` (nearest-neighbor lift).
@@ -52,7 +41,16 @@ Download from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH
 | Node | What it does |
 | --- | --- |
 | `SelfLiftH3Sampler` | The full run: low-resolution prefix → lift to the target resolution → finish the schedule. |
-| `SelfLiftH3Draft` | Runs the low-resolution prefix only, returns the low-resolution latent and writes the preview mp4. |
+| `SelfLiftH3Draft` | Runs the low-resolution prefix only, returns the low-resolution latent and writes the preview mp4 and the workflow JSON. |
+
+**What the draft hands back.** Besides the low-resolution latent it writes two files of its own into `output/selflift/` and returns their paths:
+
+| Output | File | What it is |
+| --- | --- | --- |
+| `preview_video` | `draft_<name>_<time>.mp4` | The prefix drawn with the fast decoder from `models/vae_approx` (`preview_vae`, `taeh3` for H3), at the prefix's own resolution. Connect `audio_vae` and it carries the soundscape too. |
+| `workflow_json` | `draft_<name>_<time>.json` | The run as it was: the parameters, the API graph and the UI graph it came from. Enough to repeat the run or to see afterwards what was asked for. |
+
+`preview_video` (default on) and `fps` (default 25) control the preview; `run_name` names both files.
 
 **The preview is as big as the prefix, not as big as the target.** Its pixel count is `target megapixels × lowres_scale`, decoded as it is. That is the whole sizing question: raising `lowres_scale` makes the preview bigger and leaves the finished clip alone, while raising the target makes both bigger — every high-resolution step and the lift's VAE round trip scale with the target's area.
 

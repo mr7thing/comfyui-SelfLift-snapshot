@@ -1,5 +1,5 @@
 {
-  "id": "deea384b-5422-452d-b7c7-474a120c7526",
+  "id": "354ec465-7c29-464a-881e-671fa121164a",
   "revision": 0,
   "last_node_id": 333,
   "last_link_id": 553,
@@ -942,6 +942,16 @@
           "type": "VAE",
           "shape": 7,
           "link": 554
+        },
+        {
+          "label": "run_name",
+          "localized_name": "run_name",
+          "name": "run_name",
+          "type": "STRING",
+          "widget": {
+            "name": "run_name"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -961,6 +971,13 @@
           "name": "preview_video",
           "type": "STRING",
           "links": null
+        },
+        {
+          "label": "workflow_json",
+          "localized_name": "workflow_json",
+          "name": "workflow_json",
+          "type": "STRING",
+          "links": null
         }
       ],
       "properties": {
@@ -977,7 +994,8 @@
         0.4,
         "taeh3.safetensors",
         true,
-        25.0
+        25.0,
+        "selflift"
       ],
       "widgets_values_named": {
         "seed": 684655983592117,
@@ -987,7 +1005,8 @@
         "lowres_scale": 0.4,
         "preview_vae": "taeh3.safetensors",
         "preview_video": true,
-        "fps": 25.0
+        "fps": 25.0,
+        "run_name": "selflift"
       },
       "color": "#323",
       "bgcolor": "#535"

@@ -30,17 +30,6 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 
 额外输入：`upscaler_model`、`upscaler_unload`（默认开启：放大完立即把 upscaler 从显存卸载，再进入高分辨率阶段）与 `highres_tiling`（实验性：把高分辨率阶段切成 1–8 个空间块以省显存；只保留首块音频，块间无全局注意力，不支持 ControlNet，画质和速度可能变化）。
 
-### H3 采样器会多交回两个文件
-
-除了 latent，H3 采样器还会自己往 `output/selflift/` 写两个文件，并把路径一起返回：
-
-| 输出 | 文件 | 内容 |
-| --- | --- | --- |
-| `preview_video` | `run_<名字>_<时间>.mp4` | 用 `models/vae_approx` 里的快速解码器（H3 是 `taeh3`，由 `preview_vae` 指定）画出的成片。**只是快速看一眼，不是交付物**——真正要用的画面仍然来自你接上的真实 VAE 解码。接上 `audio_vae` 还会带上声音。 |
-| `workflow_json` | `run_<名字>_<时间>.json` | 这次运行本身：参数、API 图、以及（从界面触发时的）UI 工作流。够用来复现这次运行，或者事后看清当时到底要了什么。 |
-
-`preview_video`（默认开启）与 `fps`（默认 25）控制预览；`run_name` 决定这两个文件叫什么。
-
 ### 可选 H3 upscaler
 
 从 [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载，放入 `ComfyUI/models/latent_upscale_models/` 后重启。节点默认选第一个文件名含 `h3` 的模型，找不到则为 `none`(nearest 提升）。
@@ -52,7 +41,16 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 | 节点 | 作用 |
 | --- | --- |
 | `SelfLiftH3Sampler` | 完整运行：低分辨率前缀 → 提升到目标分辨率 → 跑完剩余调度 |
-| `SelfLiftH3Draft` | 只跑低分辨率前缀，输出低分辨率 latent，并写出自己的预览 mp4 |
+| `SelfLiftH3Draft` | 只跑低分辨率前缀，输出低分辨率 latent，并写出自己的预览 mp4 和工作流 JSON |
+
+**草稿节点会交回三样东西。** 除了低分辨率 latent，它还往 `output/selflift/` 写两个文件，并把路径一起返回：
+
+| 输出 | 文件 | 内容 |
+| --- | --- | --- |
+| `preview_video` | `draft_<名字>_<时间>.mp4` | 用 `models/vae_approx` 里的快速解码器（H3 是 `taeh3`，由 `preview_vae` 指定）画出的前缀，保持前缀自己的分辨率。接上 `audio_vae` 还会带上声音。 |
+| `workflow_json` | `draft_<名字>_<时间>.json` | 这次运行本身：参数、API 图、以及（从界面触发时的）UI 工作流。够用来复现这次运行，或者事后看清当时到底要了什么。 |
+
+`preview_video`（默认开启）与 `fps`（默认 25）控制预览；`run_name` 决定这两个文件叫什么。
 
 **预览有多大，取决于前缀有多大。** 预览的像素数是 `目标像素 × lowres_scale`，按原样解码。所以想要更清楚的预览，应该调 `lowres_scale`（前缀变大，成片不变），而不是调目标分辨率（预览和成片一起变大——成片的每个高分辨率步骤、以及提升时的 VAE 往返都按目标面积涨）。
 

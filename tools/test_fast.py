@@ -99,15 +99,17 @@ def build_graph(variant):
     sampler = graph["171"]
     if variant in ("draft", "draftfull", "gridprefix", "gridprefixmatch"):
         sampler["class_type"] = "SelfLiftH3Draft"
+        sampler["inputs"]["run_name"] = f"selflift_{variant}"
     else:
         sampler["class_type"] = "SelfLiftH3Sampler"
+        # The preview and the run's own files belong to the draft node.
+        for name in ("preview_vae", "preview_video", "fps", "audio_vae", "run_name"):
+            sampler["inputs"].pop(name, None)
         sampler["inputs"]["vae"] = ["215", 0]
         sampler["inputs"].update({
             "rho": 0.6, "w_min": 0.5, "w_max": 1.0,
             "upscaler_model": "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
             "highres_tiling": True, "upscaler_unload": True,
-            "preview_vae": "taeh3.safetensors", "audio_vae": ["184", 0],
-            "run_name": f"selflift_{variant}",
         })
 
     # The video tail: the sampler feeds the decoder the way the user's graph does.

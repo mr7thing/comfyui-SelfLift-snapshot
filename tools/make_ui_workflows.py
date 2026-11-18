@@ -115,19 +115,25 @@ def build_preview(source):
         entry("preview_video", "BOOLEAN", widget=True),
         entry("fps", "FLOAT", widget=True),
         entry("audio_vae", "VAE", shape=7),
+        entry("run_name", "STRING", widget=True),
     ]
     # The seed stays put, so the preview and the finished clip are one run.
     sampler["widgets_values"] = [684655983592117, "fixed", 1, 2, 0.4,
-                                 "taeh3.safetensors", True, 25.0]
+                                 "taeh3.safetensors", True, 25.0, "selflift"]
     sampler["widgets_values_named"] = {
         "seed": 684655983592117, "control_after_generate": "fixed",
         "cfg": 1, "transition_step": 2, "lowres_scale": 0.4,
         "preview_vae": "taeh3.safetensors", "preview_video": True, "fps": 25.0,
+        "run_name": "selflift",
     }
     sampler["outputs"] = [sampler["outputs"][0]]
     sampler["outputs"].append({
         "label": "preview_video", "localized_name": "preview_video",
         "name": "preview_video", "type": "STRING", "links": None,
+    })
+    sampler["outputs"].append({
+        "label": "workflow_json", "localized_name": "workflow_json",
+        "name": "workflow_json", "type": "STRING", "links": None,
     })
     # The draft's own mp4 carries the soundscape: the audio VAE comes along.
     add_link(workflow, max(link[0] for link in workflow["links"]) + 1,
