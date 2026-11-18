@@ -91,7 +91,8 @@ def run(spec):
     if os.path.isdir(DRAFTS):
         fresh = [n for n in os.listdir(DRAFTS) if n not in before_drafts and n.endswith(".mp4")]
         if fresh:
-            preview = os.path.join(DRAFTS, max(fresh, key=lambda n: os.path.getmtime(os.path.join(DRAFTS, n))))    clip = None
+            preview = os.path.join(DRAFTS, max(fresh, key=lambda n: os.path.getmtime(os.path.join(DRAFTS, n))))
+    clip = None
     video_folder = os.path.join(OUTPUT, "video")
     if os.path.isdir(video_folder):
         fresh = [n for n in os.listdir(video_folder) if n not in before_videos and n.endswith(".mp4")]

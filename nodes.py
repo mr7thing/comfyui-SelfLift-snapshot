@@ -746,7 +746,7 @@ def _write_preview_video(run, x0, preview_vae, audio_vae=None, fps=25.0):
     The frames keep the prefix's own resolution: scaling them up to the target
     would only invent detail the prefix never had.
     """
-    return _draw_preview(_run_path("draft"), x0, run["latent_format"], preview_vae,
+    return _draw_preview(_run_path("draft") + ".mp4", x0, run["latent_format"], preview_vae,
                           audio_vae, _audio_scale(run), fps)
 
 

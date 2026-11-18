@@ -117,6 +117,8 @@ def write_video(frames, path, fps=24.0, crf=18, audio=None, audio_sample_rate=32
     """
     import av
 
+    if not path.lower().endswith(".mp4"):
+        raise ValueError(f"SelfLift: the preview needs an .mp4 file name, got {path}")
     height, width = frames.shape[1], frames.shape[2]
     height -= height % 2
     width -= width % 2
