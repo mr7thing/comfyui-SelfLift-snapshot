@@ -94,29 +94,28 @@ def build_graph(variant):
     for node_id, name in (("332", images[0]), ("333", images[1])):
         graph[node_id]["inputs"]["image"] = name.split(" [")[0]
 
-    # One graph, two front-ends: the draft is only the low-resolution prefix,
+    # One graph, two front-ends: the preview is only the low-resolution prefix,
     # the sampler lifts that prefix and finishes the clip.
     sampler = graph["171"]
-    if variant in ("draft", "draftfull", "gridprefix", "gridprefixmatch"):
-        sampler["class_type"] = "SelfLiftH3Draft"
-        sampler["inputs"]["run_name"] = f"selflift_{variant}"
+    save = graph["905"]
+    draft = variant in ("draft", "draftfull", "gridprefix", "gridprefixmatch")
+    if draft:
+        sampler["class_type"] = "SelfLiftH3DraftSampler"
+        sampler["inputs"]["draft_mode"] = True
+        save["inputs"]["file_name"] = f"selflift_{variant}"
     else:
         sampler["class_type"] = "SelfLiftH3Sampler"
-        # The preview and the run's own files belong to the draft node.
-        for name in ("preview_vae", "preview_video", "fps", "audio_vae", "run_name"):
+        for name in ("draft_mode", "preview_vae", "fps", "audio_vae"):
             sampler["inputs"].pop(name, None)
-        sampler["inputs"]["vae"] = ["215", 0]
-        sampler["inputs"].update({
-            "rho": 0.6, "w_min": 0.5, "w_max": 1.0,
-            "upscaler_model": "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
-            "highres_tiling": True, "upscaler_unload": True,
-        })
-
-    # The video tail: the sampler feeds the decoder the way the user's graph does.
+        # A full run has no files to file away.
+        for name in ("draft_video", "workflow_json", "workflow_api"):
+            save["inputs"][name] = ""
+    # The video tail: the latent reaches the decoders through the save node, the
+    # way the user's graph does. In a full run the save node passes it on.
     graph["901"] = {"class_type": "VAEDecode",
-                    "inputs": {"samples": ["171", 0], "vae": ["215", 0]}}
+                    "inputs": {"samples": ["905", 0], "vae": ["215", 0]}}
     graph["902"] = {"class_type": "VAEDecodeAudio",
-                    "inputs": {"samples": ["171", 0], "vae": ["184", 0]}}
+                    "inputs": {"samples": ["905", 0], "vae": ["184", 0]}}
     graph["903"] = {"class_type": "CreateVideo",
                     "inputs": {"images": ["901", 0], "audio": ["902", 0], "fps": 25.0,
                                "bit_depth": 8, "color_space": "sRGB",
@@ -236,7 +235,8 @@ def main():
     try:
         info = get(SERVER, "/object_info")
         assert "SelfLiftH3Sampler" in info, "the sampler node is not registered"
-        assert "SelfLiftH3Draft" in info, "the draft node is not registered"
+        assert "SelfLiftH3DraftSampler" in info, "the draft sampler node is not registered"
+        assert "SelfLiftH3Save" in info, "the save node is not registered"
         say(f"=== the {variant} graph ===")
         started = time.time()
         try:

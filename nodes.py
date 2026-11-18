@@ -5,17 +5,23 @@ endpoint to the target resolution with the training-free Artifact-Aware
 Consistency Lift (arXiv:2609.02036), re-noise it at the transition sigma, and
 finish the schedule at full resolution.
 
-Two front-ends share the same engine:
+Three front-ends share the same engine:
 - SelfLiftH3Sampler: MiniMax H3 audio-video (nested AV latents; the audio stream
   has no spatial dimensions and continues through the reused Euler boundary step).
   This is an experimental extension beyond the paper's image-model evaluation.
+- SelfLiftH3DraftSampler: the same sampler with a draft mode -- the low-resolution
+  prefix only, for a look at the run in seconds. It draws that prefix and writes
+  the run down; SelfLiftH3Save downstream files the files away and decides what
+  happens to the latent.
 - SelfLiftImageSampler: compatible rectified-flow image models.
 """
 
+import copy
 import json
 import logging
 import os
 import time
+import uuid
 
 import torch
 
@@ -29,6 +35,12 @@ import comfy.samplers
 import comfy.utils
 import folder_paths
 import latent_preview
+
+try:
+    # ComfyUI's way of saying "the nodes downstream of this one do not run".
+    from comfy_execution.graph_utils import ExecutionBlocker
+except ImportError:  # older ComfyUI: the downstream cannot be stopped at runtime
+    ExecutionBlocker = None
 
 from . import selflift
 from . import h3_upscaler
@@ -208,8 +220,55 @@ def _euler_step(state, denoised, sigma, sigma_next):
     return state + (state - denoised.to(state)) * step
 
 
-def _resize_keyframes(cond, h, w):
-    """Keyframe cond latents share the generation grid; resize them to the low-res one."""
+def _keyframe_noise_seed(seed, index):
+    """A stable seed for the noise one keyframe gets back.
+
+    It follows the run's own seed, so a run that is repeated lands on the same
+    keyframe noise; the index keeps the keyframes of one run apart.
+    """
+    base = 0 if seed is None else int(seed)
+    return (base + (index + 1) * 0x9E3779B1) % (1 << 63)
+
+
+def _restore_keyframe_noise(kf, source_latent, resized_latent, h, w, seed, index):
+    """Put the noise a weakened keyframe carries back into the low-res keyframe.
+
+    H3 Studio writes a keyframe as `a*z + (1-a)*noise` and keeps `a` in the
+    condition as `noise_aug`, so `1-noise_aug` is exactly the noise the
+    full-resolution keyframe carries. Averaging the keyframe down averages that
+    noise with it: the per-pixel noise level falls with the number of cells one
+    output pixel covers. The same amount of noise is therefore added back, from
+    a seed that follows the run's own seed.
+
+    A keyframe without `noise_aug` was not weakened this way -- either it is at
+    full strength, or it was weakened by a path that does not say so -- and is
+    left alone.
+    """
+    noise_aug = kf.get("noise_aug")
+    if noise_aug is None:
+        return None
+    fraction = max(0.0, 1.0 - float(noise_aug))
+    cells = (source_latent.shape[-2] / float(h)) * (source_latent.shape[-1] / float(w))
+    if fraction <= 0.0 or cells <= 1.0:
+        return None
+    deficit = fraction * max(0.0, 1.0 - 1.0 / cells) ** 0.5
+    generator = torch.Generator("cpu").manual_seed(_keyframe_noise_seed(seed, index))
+    noise = torch.randn(resized_latent.shape, generator=generator, dtype=torch.float32)
+    return resized_latent + noise.to(resized_latent.device) * deficit
+
+
+def _resize_keyframes(cond, h, w, seed=None, restore_noise=False, label=""):
+    """Keyframe cond latents share the generation grid; resize them to the low-res one.
+
+    With `restore_noise` the keyframe is resampled by averaging instead of by
+    bilinear interpolation, and the noise a weakened keyframe carries is put
+    back. Averaging is what makes that possible: bilinear interpolation aliases
+    the noise instead of averaging it, and it drifts the geometry the keyframe
+    pins. The plain sampler leaves this off and keeps its old numbers.
+
+    `label` only names the conditioning in the log: the positive and the
+    negative carry the same keyframes, so the same work happens twice.
+    """
     out = []
     for tensor, d in cond:
         kfs = d.get("minimax_keyframes")
@@ -218,27 +277,44 @@ def _resize_keyframes(cond, h, w):
             continue
         d = d.copy()
         resized = []
-        for kf in kfs:
+        for index, kf in enumerate(kfs):
             kf = dict(kf)
             lat = kf.get("latent")
             if lat is not None and (lat.shape[-2] != h or lat.shape[-1] != w):
                 if lat.ndim == 5:
                     # spatial-only resize per frame; never interpolates across time
                     batch, channels, frames = lat.shape[:3]
-                    resized_latent = torch.nn.functional.interpolate(
-                        lat.float().permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, lat.shape[-2], lat.shape[-1]),
-                        size=(h, w), mode="bilinear", align_corners=False
-                    )
-                    resized_latent = resized_latent.reshape(batch, frames, channels, h, w).permute(0, 2, 1, 3, 4)
+                    source = lat.float().permute(0, 2, 1, 3, 4).reshape(
+                        batch * frames, channels, lat.shape[-2], lat.shape[-1])
+                else:
+                    source = lat.float()
+                if restore_noise:
+                    resized_latent = torch.nn.functional.interpolate(source, size=(h, w), mode="area")
                 else:
                     resized_latent = torch.nn.functional.interpolate(
-                        lat.float(), size=(h, w), mode="bilinear", align_corners=False
-                    )
+                        source, size=(h, w), mode="bilinear", align_corners=False)
+                if lat.ndim == 5:
+                    resized_latent = resized_latent.reshape(batch, frames, channels, h, w).permute(0, 2, 1, 3, 4)
                 # per-channel, per-frame mean match: fixes bilinear's color drift without
                 # restoring variance the low-res grid cannot represent
                 source_mean = lat.float().mean(dim=(-2, -1), keepdim=True)
                 resized_mean = resized_latent.mean(dim=(-2, -1), keepdim=True)
-                kf["latent"] = (resized_latent + (source_mean - resized_mean)).to(lat)
+                resized_latent = resized_latent + (source_mean - resized_mean)
+                if restore_noise:
+                    restored = _restore_keyframe_noise(kf, lat, resized_latent, h, w, seed, index)
+                    if restored is not None:
+                        resized_latent = restored
+                        logging.info(
+                            "[SelfLift H3 Studio] %s keyframe %d: %dx%d -> %dx%d, area-resampled and the "
+                            "noise put back (noise_aug %.4f, so %.1f%% of the keyframe is noise).",
+                            label or "conditioning", index + 1, lat.shape[-2], lat.shape[-1], h, w,
+                            float(kf["noise_aug"]), (1.0 - float(kf["noise_aug"])) * 100.0)
+                    else:
+                        logging.info(
+                            "[SelfLift H3 Studio] %s keyframe %d: %dx%d -> %dx%d, area-resampled; no noise to "
+                            "put back (the keyframe carries no noise label, or it needed no downscale).",
+                            label or "conditioning", index + 1, lat.shape[-2], lat.shape[-1], h, w)
+                kf["latent"] = resized_latent.to(lat)
             resized.append(kf)
         d["minimax_keyframes"] = resized
         out.append((tensor, d))
@@ -263,9 +339,41 @@ def _debug_dump(vae, latents):
         Image.fromarray(frame).save(os.path.join(out_dir, name + ".png"))
 
 
+def _tst_installed(model):
+    """Is SelfLift's TST wrapper on this model?
+
+    The wrapper registers itself under its own key, so nobody else's attention
+    override can be mistaken for it.
+    """
+    try:
+        wrappers = getattr(model, "wrappers", None) or {}
+        return "selflift_h3_tst" in (wrappers.get("diffusion_model") or {})
+    except Exception:
+        return False
+
+
+def _note_h3_studio_conditions(cond, sigmas):
+    """Say out loud what the H3 Studio cooperation path changes about this run."""
+    if sigmas.numel() > 1 and float(sigmas[0]) < 1.0:
+        logging.info("[SelfLift H3 Studio] this schedule starts at sigma=%.4f instead of at pure noise: "
+                     "the run begins from the source latent (v2v / img2img semantics).",
+                     float(sigmas[0]))
+    for tensor, d in cond:
+        blocks = 0
+        for kf in d.get("minimax_keyframes") or []:
+            lat = kf.get("latent")
+            if lat is not None and lat.ndim == 5 and lat.shape[2] > 1:
+                blocks += 1
+        if blocks:
+            logging.info("[SelfLift H3 Studio] %d multi-frame keyframe block(s) (motion context / video anchor) "
+                         "are downscaled with the low-resolution prefix: the keyframe grid rule leaves no other "
+                         "option, so the join can be softer here than in a native H3 Studio run.", blocks)
+
+
 def _setup_run(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                transition_step, lowres_scale, rho, w_min, w_max, latent_upsample,
-               latent_lifter=None, highres_tiling=False, model_hires=None, draft=False):
+               latent_lifter=None, highres_tiling=False, model_hires=None, draft=False,
+               h3_studio_coop=False):
     """Validate a run and build what both sampling stages share.
 
     Nothing here samples; the returned dict is what the stage functions read.
@@ -291,6 +399,17 @@ def _setup_run(model, positive, negative, vae, latent_image, sampler, sigmas, se
         model, latent_image["samples"], latent_image.get("downscale_ratio_spacial", None),
         latent_image.get("downscale_ratio_temporal", None)))
     hires_base = model_hires if model_hires is not None else model
+    if h3_studio_coop and highres_tiling:
+        if _tst_installed(hires_base):
+            raise ValueError(
+                "SelfLift H3: TST and highres_tiling cannot run together -- the tiling wrapper "
+                "sits inside the TST one, so the tiled attention calls never reach the correction "
+                "and TST would be skipped without a trace. Turn the tiling off, or take the TST "
+                "node out of the model chain."
+            )
+        if _tst_installed(model) and hires_base is not model:
+            logging.info("[SelfLift H3 Studio] the high-resolution stage runs on a different model "
+                         "than the TST-patched one, so that stage gets no TST correction.")
     high_model = h3_tiling.tiled_model(hires_base, [tuple(stream.shape) for stream in streams]) if highres_tiling else hires_base
     video = streams[0].ndim == 5
     if video:
@@ -378,10 +497,14 @@ def _setup_run(model, positive, negative, vae, latent_image, sampler, sigmas, se
     callback = latent_preview.prepare_callback(model, total_steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     if video:  # keyframe cond latents share the generation grid on MiniMax H3
-        positive_low = _resize_keyframes(positive, h, w)
-        negative_low = _resize_keyframes(negative, h, w)
+        positive_low = _resize_keyframes(positive, h, w, seed=seed, restore_noise=h3_studio_coop,
+                                         label="positive")
+        negative_low = _resize_keyframes(negative, h, w, seed=seed, restore_noise=h3_studio_coop,
+                                         label="negative")
     else:
         positive_low, negative_low = positive, negative
+    if h3_studio_coop:
+        _note_h3_studio_conditions(positive_low, sigmas)
 
     latent_format = model.get_model_object("latent_format")
     resolution_scale = getattr(latent_format, "spacial_downscale_ratio", 1)
@@ -571,13 +694,14 @@ def _run_high_stage(run, resume, positive, negative):
 
 def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                        transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
-                       highres_tiling=False, model_hires=None):
+                       highres_tiling=False, model_hires=None, h3_studio_coop=False):
     _validate_schedule(sigmas, transition_step)
     if sigmas.numel() < 2:
         return latent_image
     run = _setup_run(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                      transition_step, lowres_scale, rho, w_min, w_max, latent_upsample,
-                     latent_lifter=latent_lifter, highres_tiling=highres_tiling, model_hires=model_hires)
+                     latent_lifter=latent_lifter, highres_tiling=highres_tiling, model_hires=model_hires,
+                     h3_studio_coop=h3_studio_coop)
     frozen = _run_low_stage(run)
     resume = _run_transition(run, frozen["state"], frozen["x0"])
     return _run_high_stage(run, resume, positive, negative)
@@ -630,26 +754,24 @@ class SelfLiftH3Sampler:
                                    latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires),)
 
 
-class SelfLiftH3Draft:
-    """Run only the low-resolution part of a SelfLift H3 run, and draw it.
+class SelfLiftH3DraftSampler:
+    """The SelfLift H3 sampler with a draft mode.
 
-    The draft samples the low-resolution prefix of the run and stops there, so
-    it costs a fraction of the full run. With the same seed, prompt and reference
-    setup, the draft is literally the beginning of a full run at the same
-    `transition_step`: the full run lifts that prefix to the target resolution
-    and finishes the schedule, so the draft shows what the full run starts
-    from -- at low resolution.
+    `draft_mode` decides how much of the run happens. With it on, the run is a
+    draft: only the low-resolution prefix is sampled, no lift and no
+    high-resolution steps, and the latent does not travel on -- nothing
+    downstream decodes it. The prefix is drawn with the fast decoder from
+    `models/vae_approx`, and the run is written down as two standard ComfyUI
+    workflows with the draft mode switched off -- the workflows that produce
+    the clip.
 
-    Set `transition_step` to the whole step count for a complete low-resolution
-    sample instead: readable, but a different trajectory from a full run.
+    With it off, the run is the full one and this node is no different from
+    `SelfLiftH3Sampler`: prefix, lift, finish, and the latent that comes out
+    is the finished clip's.
 
-    The preview is drawn with the small decoder in `models/vae_approx` (taeh3),
-    at the prefix's own resolution. Nothing is scaled up: the preview is what
-    the low-resolution prefix actually looks like, which is the point of it.
-
-    It writes two files of its own into `output/selflift/` and hands back
-    their paths: the preview mp4 and a JSON file with the run itself -- the
-    parameters, the API graph and the UI graph it came from.
+    What comes out is a latent either way, plus the three files the run
+    produced. `SelfLiftH3Save` downstream files them away and decides what
+    happens to the latent.
     """
 
     @classmethod
@@ -658,34 +780,58 @@ class SelfLiftH3Draft:
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
-            "latent_image": ("LATENT", {"tooltip": "Target-resolution H3 AV latent defining size and duration. The draft samples the low-resolution prefix of this grid."}),
-            "sampler": ("SAMPLER", {"tooltip": "Standard Euler only."}),
+            "vae": ("VAE", {"tooltip": "Video VAE used for the pixel re-encode anchor at the resolution transition."}),
+            "latent_image": ("LATENT", {"tooltip": "Target-resolution H3 AV latent defining size and duration. Existing latent content and noise masks are accepted."}),
+            "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
-            "transition_step": ("INT", {"default": 2, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. Use the full run's value to preview its prefix; use the whole step count for a complete low-resolution sample."}),
-            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix. It sets the preview's resolution: the preview is this fraction of the target, and its sampling cost follows its own area, not the target's."}),
-        }, "optional": {
+            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. The paper uses 6 of 8 NFEs for its 8-step image model; H3 requires independent validation."}),
+            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix (paper: 0.5). It sets the preview's resolution: the preview is this fraction of the target, and its sampling cost follows its own area, not the target's."}),
+            "rho": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of highest-risk spatiotemporal locations corrected toward the pixel-VAE anchor. The H3 default 0 uses only the external latent upscaler and skips the VAE round trip. For SelfLift-zero with upscaler_model=none, start near 0.6."}),
+            "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength floor. H3's widespread nearest-lift error can require 1.0; 0.5 is the paper's image-model setting."}),
+            "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength ceiling. Keep at 1.0 for the H3 SelfLift-zero diagnostic."}),
+            "upscaler_model": _upscaler_input(),
+            "draft_mode": ("BOOLEAN", {"default": True, "label_on": "草稿模式：开启", "label_off": "草稿模式：关闭", "tooltip": "On: a draft -- only the low-resolution prefix is sampled, no lift and no high-resolution steps, and the latent does not travel on. Off: the full run, and this node behaves exactly like the plain sampler."}),
             "preview_vae": _preview_vae_input(),
-            "preview_video": ("BOOLEAN", {"default": True, "label_on": "预览视频：开启", "label_off": "预览视频：关闭", "tooltip": "Draw the prefix with the fast preview decoder in models/vae_approx and write it as an mp4 at the prefix's own resolution. No scaling: the preview stays as small as the prefix is."}),
-            "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0, "step": 1.0, "tooltip": "Frame rate of the preview mp4. Match the frame rate of the full run so the two can be compared frame by frame."}),
-            "audio_vae": ("VAE", {"tooltip": "Optional: the H3 audio VAE. Connect it and the preview mp4 carries the soundscape the model had at the end of the prefix."}),
-            "run_name": ("STRING", {"default": "selflift", "tooltip": "Name for the files this run writes: the preview mp4 and the workflow JSON."}),
-        }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
+            "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0, "step": 1.0, "tooltip": "Frame rate of the preview mp4. Match the frame rate of the finished clip so the two can be compared frame by frame."}),
+        }, "optional": {
+            "model_hires": ("MODEL", {"tooltip": "Optional: model used for the high-resolution stage instead of `model` (e.g. a different checkpoint or LoRA stack). Must share the same architecture and latent format. The low-resolution prefix always runs on `model`."}),
+            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental: select 1–8 spatial tiles from available memory at high-resolution preparation. Audio input and references remain complete; only the first tile's audio prediction is retained. Quality and speed may change."}),
+            "upscaler_unload": ("BOOLEAN", {"default": True, "label_on": "放大后卸载：开启", "label_off": "放大后卸载：关闭", "tooltip": "Unload the external H3 upscaler from VRAM right after the lift, before the high-resolution stage loads. Disable only if the upscaler is reused between runs and VRAM is not tight."}),
+            "audio_vae": ("VAE", {"tooltip": "Optional: the H3 audio VAE. Connect it and the preview mp4 carries the soundscape too."}),
+        }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"}}
 
-    RETURN_TYPES = ("LATENT", "STRING", "STRING")
-    RETURN_NAMES = ("draft_latent", "preview_video", "workflow_json")
+    RETURN_TYPES = ("LATENT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("latent", "draft_video", "workflow_json", "workflow_api")
     FUNCTION = "sample"
     CATEGORY = "selflift"
-    OUTPUT_NODE = True
 
-    def sample(self, model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
-               transition_step, lowres_scale, preview_vae=None, preview_video=True, fps=25.0,
-               audio_vae=None, run_name="selflift", prompt=None, extra_pnginfo=None):
-        if preview_vae is None:
-            preview_vae = _default_preview_vae()
+    def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
+               transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, draft_mode=True,
+               preview_vae="taeh3.safetensors", fps=25.0, model_hires=None, highres_tiling=False,
+               upscaler_unload=True, audio_vae=None, prompt=None, extra_pnginfo=None, unique_id=None):
+        if not draft_mode:
+            if rho == 0.0 and upscaler_model == "none":
+                raise ValueError(
+                    "SelfLift H3: rho=0 with upscaler_model=none disables both SelfLift-zero correction "
+                    "and external latent upscaling; choose rho>0 or select an external H3 upscaler."
+                )
+            lifter = None
+            if upscaler_model != "none":
+                if rho > 0.0 and w_max > 0.0:
+                    logging.warning("SelfLift H3: rho > 0 with an external upscaler is a hybrid experiment; select upscaler_model=none to test the paper's SelfLift-zero direct route")
+                lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=upscaler_unload)
+            full = progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
+                                     transition_step, lowres_scale, rho, w_min, w_max, "nearest",
+                                     latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires,
+                                     h3_studio_coop=True)
+            return (full, "", "", "")
+
+        # The draft: the low-resolution prefix of the run, and nothing else.
         run = _setup_run(model, positive, negative, None, latent_image, sampler, sigmas, seed, cfg,
-                         transition_step, lowres_scale, 0.0, 0.0, 0.0, "nearest", draft=True)
+                         transition_step, lowres_scale, 0.0, 0.0, 0.0, "nearest", draft=True,
+                         h3_studio_coop=True)
         frozen = _run_low_stage(run)
         draft = {"samples": frozen["x0"].to(device=comfy.model_management.intermediate_device(),
                                             dtype=comfy.model_management.intermediate_dtype())}
@@ -693,45 +839,83 @@ class SelfLiftH3Draft:
             draft["batch_index"] = latent_image["batch_index"]
         logging.info("[SelfLift draft] low-resolution latent %s", tuple(draft["samples"].shape))
 
-        stem = _run_path("draft", run_name or "selflift")
-        video_path = ""
-        if preview_video:
-            video_path = _write_preview_video(run, frozen["x0"], stem + ".mp4", preview_vae, audio_vae, fps) or ""
-        params = {
-            "seed": seed, "cfg": cfg, "transition_step": transition_step, "lowres_scale": lowres_scale,
-            "steps": int(sigmas.numel() - 1), "preview_vae": preview_vae, "fps": fps,
-            "latent_shape": [list(stream.shape) for stream in _streams(frozen["x0"])[0]],
-        }
-        json_path = _workflow_json(stem + ".json", params, prompt, extra_pnginfo,
-                                   {"preview_video": video_path})
-        return {"ui": {"preview_video": [video_path], "workflow_json": [json_path]},
-                "result": (draft, video_path, json_path)}
+        if preview_vae == "none":
+            preview_vae = _default_preview_vae()
+        video_path = _draw_preview(_staging_path("draft.mp4"), draft["samples"],
+                                   run["latent_format"], preview_vae, audio_vae,
+                                   _audio_scale_of(model), fps) or ""
+        workflow_text, api_text = _run_workflows(unique_id, prompt, extra_pnginfo)
+        return (draft, video_path, workflow_text, api_text)
 
 
-def _audio_scale(run):
+class SelfLiftH3Save:
+    """File the run away, and decide what happens to the latent.
+
+    The node looks at the sampler that fed it. A sampler that ran in draft mode
+    means this run is a draft: the node then files the files the run produced
+    -- the draft video and the two workflows -- into the folder and under the
+    name it was given, and keeps the latent to itself, so the decoders
+    downstream stay quiet.
+
+    A full run is passed straight on, and nothing is written.
+
+    The files are moved, not copied: the sampler leaves them in a staging
+    folder, and this node is where they end up.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT", {"tooltip": "The latent to pass on, or to keep."}),
+            "draft_video": ("STRING", {"tooltip": "The draft video the sampler drew. It is moved into the folder below."}),
+            "workflow_json": ("STRING", {"tooltip": "The canvas workflow the sampler wrote out, with the draft mode switched off."}),
+            "workflow_api": ("STRING", {"tooltip": "The API prompt the sampler wrote out, with the draft mode switched off."}),
+            "output_folder": ("STRING", {"default": "selflift", "tooltip": "Folder under the ComfyUI output directory the files go into."}),
+            "file_name": ("STRING", {"default": "selflift", "tooltip": "Name the files are filed under. The time of the run is added to it."}),
+        }, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"}}
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "sample"
+    CATEGORY = "selflift"
+    OUTPUT_NODE = True
+
+    def sample(self, latent, draft_video, workflow_json, workflow_api, output_folder, file_name,
+               prompt=None, extra_pnginfo=None, unique_id=None):
+        sampler_id = _upstream_sampler(prompt, unique_id)
+        if not _runs_in_draft(prompt, sampler_id):
+            logging.info("[SelfLift] a full run: the latent carries on")
+            return (latent,)
+
+        stem = os.path.join(_output_folder(output_folder),
+                            f"{file_name or 'selflift'}_{time.strftime('%Y%m%d-%H%M%S')}")
+        _file_away(draft_video, stem + ".mp4")
+        _file_away(workflow_json, stem + ".workflow.json")
+        _file_away(workflow_api, stem + ".api.json")
+        logging.info("[SelfLift] filed under %s", stem)
+
+        if ExecutionBlocker is None:
+            logging.warning("[SelfLift] this ComfyUI cannot stop the downstream nodes; "
+                            "the decoders will run on the preview latent")
+            return (latent,)
+        return (ExecutionBlocker(None),)
+
+
+def _audio_scale_of(model):
     """The factor the sampler carries the audio stream at (H3: shift / audio_shift).
 
     The sampler works on the audio stream scaled onto the video schedule, so a
     frozen endpoint has to be brought back to the audio VAE's own scale before
     it can be decoded.
     """
-    scale = getattr(run["model_sampling"], "audio_scale", None)
+    model_sampling = model.get_model_object("model_sampling")
+    scale = getattr(model_sampling, "audio_scale", None)
     if scale is not None:
         return float(scale)
-    getter = getattr(run["model"].model, "audio_scale", None)
+    getter = getattr(model.model, "audio_scale", None)
     if getter is not None:
         return float(getter())
     return 1.0
-
-
-def _write_preview_video(run, x0, path, preview_vae, audio_vae=None, fps=25.0):
-    """Draw the low-resolution prefix with the fast preview decoder.
-
-    The frames keep the prefix's own resolution: scaling them up to the target
-    would only invent detail the prefix never had.
-    """
-    return _draw_preview(path, x0, run["latent_format"], preview_vae,
-                          audio_vae, _audio_scale(run), fps)
 
 
 def _draw_preview(path, samples, latent_format, preview_vae, audio_vae=None, audio_scale=1.0, fps=25.0):
@@ -769,7 +953,7 @@ def _draw_preview(path, samples, latent_format, preview_vae, audio_vae=None, aud
         waveform, sample_rate = h3_preview.decode_audio(audio_vae, audio_latent)
         audio = waveform[0].detach().float().cpu()
     h3_preview.write_video(frames, path, fps=fps, audio=audio, audio_sample_rate=sample_rate)
-    logging.info("[SelfLift] preview %s at %dx%d", path, frames.shape[2], frames.shape[1])
+    logging.info("[SelfLift] preview %s at %dx%d", path, frames.shape[1], frames.shape[2])
     return path
 
 
@@ -780,30 +964,142 @@ def _run_folder():
     return folder
 
 
-def _run_path(prefix, name=""):
-    """A file name for one run's own output: the name and the time."""
-    stem = prefix + ("_" + name if name else "") + "_" + time.strftime("%Y%m%d-%H%M%S")
-    return os.path.join(_run_folder(), stem)
+def _staging_path(name):
+    """A place in the staging folder, where a run's files wait to be filed."""
+    folder = os.path.join(_run_folder(), ".staging")
+    os.makedirs(folder, exist_ok=True)
+    stem, extension = os.path.splitext(name)
+    return os.path.join(folder, f"{stem}_{uuid.uuid4().hex[:8]}{extension}")
 
 
-def _workflow_json(path, params, prompt=None, extra_pnginfo=None, outputs=None):
-    """Save a run as a JSON file: what it was, and the graph that made it.
+def _output_folder(name):
+    """A folder under the ComfyUI output directory."""
+    folder = os.path.join(folder_paths.get_output_directory(), name or "selflift")
+    os.makedirs(folder, exist_ok=True)
+    return folder
 
-    The API graph comes from the run itself and the UI graph from the
-    extra data ComfyUI passes along, so the file is enough to repeat the run
-    or to see afterwards what was asked for.
+
+def _file_away(source, target):
+    """File one thing away: a file moves, a text is written out.
+
+    The sampler leaves its files in the staging folder; this is where they end
+    up. Text comes as the content itself, so it is written out.
     """
-    payload = {
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "params": params,
-        "prompt": prompt or {},
-        "workflow": (extra_pnginfo or {}).get("workflow", {}),
-        "outputs": outputs or {},
-    }
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=1)
-    logging.info("[SelfLift] workflow %s", path)
-    return path
+    if not source:
+        return
+    if os.path.isfile(source):
+        os.replace(source, target)
+        return
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(source)
+
+
+def _upstream_sampler(prompt, unique_id):
+    """The node that feeds this one's latent: the run that is being filed."""
+    node = (prompt or {}).get(unique_id) or {}
+    value = (node.get("inputs") or {}).get("latent")
+    if isinstance(value, list) and len(value) == 2:
+        return value[0]
+    return None
+
+
+def _runs_in_draft(prompt, sampler_id):
+    """Whether the sampler that fed us ran in draft mode.
+
+    The sampler carries the switch, so the two cannot disagree about what the
+    run was: one switch, and the node that files the run reads it from there.
+    """
+    if sampler_id is None:
+        return False
+    node = (prompt or {}).get(sampler_id) or {}
+    if node.get("class_type") != "SelfLiftH3DraftSampler":
+        return False
+    inputs = node.get("inputs") or {}
+    if "draft_mode" in inputs:
+        return bool(inputs["draft_mode"])
+    return True   # the sampler's own default
+
+
+def _run_workflows(unique_id, prompt=None, extra_pnginfo=None):
+    """The run's two standard workflows, with the draft mode switched off.
+
+    Two forms, both of which ComfyUI reads: the canvas graph when the run came
+    from the canvas, and the API prompt either way. This node's `draft_mode` is
+    turned off in both, so the workflows that come out are the ones that produce
+    the clip.
+
+    The parameters are not written anywhere else: in a canvas workflow they are
+    the nodes' own widget values, in the API prompt they are the inputs.
+
+    Returns:
+        The canvas workflow and the API prompt, as JSON text.
+    """
+    workflow = (extra_pnginfo or {}).get("workflow") or {}
+    if workflow:
+        canvas = copy.deepcopy(workflow)
+        _switch_off_draft(canvas, unique_id)
+    else:
+        # An API-driven run has no canvas graph; the API prompt is the workflow,
+        # and the frontend turns it into one when it is loaded.
+        canvas = copy.deepcopy(prompt or {})
+        _switch_off_draft_prompt(canvas, unique_id)
+    api = copy.deepcopy(prompt or {})
+    _switch_off_draft_prompt(api, unique_id)
+    return _dump_json_text(canvas), _dump_json_text(api)
+
+
+def _switch_off_draft(workflow, node_id):
+    """Turn a canvas node's `draft_mode` widget off."""
+    if node_id is None:
+        return
+    for node in workflow.get("nodes") or []:
+        if str(node.get("id")) != str(node_id):
+            continue
+        named = node.get("widgets_values_named")
+        if isinstance(named, dict) and "draft_mode" in named:
+            named["draft_mode"] = False
+        widgets = [item for item in node.get("inputs") or [] if item.get("widget")]
+        values = node.get("widgets_values") or []
+        for index, item in enumerate(widgets):
+            if item.get("name") != "draft_mode":
+                continue
+            slot = _draft_widget_slot(values, widgets, index, named)
+            if slot is not None and slot < len(values):
+                values[slot] = False
+            return
+
+
+def _draft_widget_slot(values, widgets, index, named):
+    """Where a widget's value sits in the canvas node's `widgets_values` list.
+
+    The list holds one entry per widget, plus one more for every widget that
+    carries a `control_after_generate` button (the seed has one). The named
+    values, when the workflow has them, say where each widget ended up.
+    """
+    if isinstance(named, dict) and "draft_mode" in named:
+        keys = list(named.keys())
+        if "draft_mode" in keys:
+            slot = keys.index("draft_mode")
+            if slot < len(values) and values[slot] == named["draft_mode"]:
+                return slot
+    extra = max(0, len(values) - len(widgets))
+    return index if index == 0 else index + extra
+
+
+def _switch_off_draft_prompt(prompt, node_id):
+    """Turn a prompt node's `draft_mode` input off."""
+    if node_id is None:
+        return
+    node = (prompt or {}).get(node_id)
+    if node is None:
+        return
+    inputs = node.setdefault("inputs", {})
+    if "draft_mode" in inputs:
+        inputs["draft_mode"] = False
+
+
+def _dump_json_text(payload):
+    return json.dumps(payload, ensure_ascii=False, indent=1)
 
 
 class SelfLiftImageSampler:
@@ -865,14 +1161,16 @@ class SelfLiftH3TST:
 
 NODE_CLASS_MAPPINGS = {
     "SelfLiftH3Sampler": SelfLiftH3Sampler,
-    "SelfLiftH3Draft": SelfLiftH3Draft,
+    "SelfLiftH3DraftSampler": SelfLiftH3DraftSampler,
+    "SelfLiftH3Save": SelfLiftH3Save,
     "SelfLiftImageSampler": SelfLiftImageSampler,
     "SelfLiftH3TST": SelfLiftH3TST,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SelfLiftH3Sampler": "SelfLift Progressive Sampler (MiniMax H3)",
-    "SelfLiftH3Draft": "SelfLift H3 Draft (low-resolution preview)",
+    "SelfLiftH3DraftSampler": "SelfLift H3 Draft Mode Sampler (MiniMax H3)",
+    "SelfLiftH3Save": "SelfLift H3 Save (file the run away)",
     "SelfLiftImageSampler": "SelfLift Progressive Sampler (Image)",
     "SelfLiftH3TST": "H3 Temporal State Transport (TST)",
 }

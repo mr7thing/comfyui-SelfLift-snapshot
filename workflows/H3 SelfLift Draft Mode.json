@@ -1,8 +1,8 @@
 {
-  "id": "354ec465-7c29-464a-881e-671fa121164a",
+  "id": "3b202050-df2b-411c-947e-b153932e1a27",
   "revision": 0,
-  "last_node_id": 333,
-  "last_link_id": 553,
+  "last_node_id": 400,
+  "last_link_id": 558,
   "nodes": [
     {
       "id": 173,
@@ -283,7 +283,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 24,
+      "order": 25,
       "mode": 0,
       "inputs": [
         {
@@ -493,7 +493,7 @@
         235.2093023255814
       ],
       "flags": {},
-      "order": 28,
+      "order": 29,
       "mode": 0,
       "inputs": [
         {
@@ -569,7 +569,7 @@
         }
       },
       "widgets_values": [
-        "video/draft",
+        "video/ComfyUI",
         "auto",
         "auto",
         "auto"
@@ -595,7 +595,7 @@
         150
       ],
       "flags": {},
-      "order": 27,
+      "order": 28,
       "mode": 0,
       "inputs": [
         {
@@ -708,7 +708,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 26,
+      "order": 27,
       "mode": 0,
       "inputs": [
         {
@@ -765,7 +765,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 25,
+      "order": 26,
       "mode": 0,
       "inputs": [
         {
@@ -810,7 +810,7 @@
     },
     {
       "id": 171,
-      "type": "SelfLiftH3Draft",
+      "type": "SelfLiftH3DraftSampler",
       "pos": [
         2640.6858255839516,
         76.73822317890779
@@ -845,6 +845,13 @@
           "link": 346
         },
         {
+          "label": "vae",
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": 396
+        },
+        {
           "label": "latent_image",
           "localized_name": "latent_image",
           "name": "latent_image",
@@ -864,6 +871,22 @@
           "name": "sigmas",
           "type": "SIGMAS",
           "link": 410
+        },
+        {
+          "label": "model_hires",
+          "localized_name": "model_hires",
+          "name": "model_hires",
+          "type": "MODEL",
+          "link": null,
+          "shape": 7
+        },
+        {
+          "label": "audio_vae",
+          "localized_name": "audio_vae",
+          "name": "audio_vae",
+          "type": "VAE",
+          "shape": 7,
+          "link": 558
         },
         {
           "label": "seed",
@@ -906,22 +929,62 @@
           "link": null
         },
         {
+          "label": "rho",
+          "localized_name": "rho",
+          "name": "rho",
+          "type": "FLOAT",
+          "widget": {
+            "name": "rho"
+          },
+          "link": null
+        },
+        {
+          "label": "w_min",
+          "localized_name": "w_min",
+          "name": "w_min",
+          "type": "FLOAT",
+          "widget": {
+            "name": "w_min"
+          },
+          "link": null
+        },
+        {
+          "label": "w_max",
+          "localized_name": "w_max",
+          "name": "w_max",
+          "type": "FLOAT",
+          "widget": {
+            "name": "w_max"
+          },
+          "link": null
+        },
+        {
+          "label": "upscaler_model",
+          "localized_name": "upscaler_model",
+          "name": "upscaler_model",
+          "type": "COMBO",
+          "widget": {
+            "name": "upscaler_model"
+          },
+          "link": null
+        },
+        {
+          "label": "draft_mode",
+          "localized_name": "draft_mode",
+          "name": "draft_mode",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "draft_mode"
+          },
+          "link": null
+        },
+        {
           "label": "preview_vae",
           "localized_name": "preview_vae",
           "name": "preview_vae",
           "type": "COMBO",
           "widget": {
             "name": "preview_vae"
-          },
-          "link": null
-        },
-        {
-          "label": "preview_video",
-          "localized_name": "preview_video",
-          "name": "preview_video",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "preview_video"
           },
           "link": null
         },
@@ -936,20 +999,22 @@
           "link": null
         },
         {
-          "label": "audio_vae",
-          "localized_name": "audio_vae",
-          "name": "audio_vae",
-          "type": "VAE",
-          "shape": 7,
-          "link": 554
+          "label": "highres_tiling",
+          "localized_name": "highres_tiling",
+          "name": "highres_tiling",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "highres_tiling"
+          },
+          "link": null
         },
         {
-          "label": "run_name",
-          "localized_name": "run_name",
-          "name": "run_name",
-          "type": "STRING",
+          "label": "upscaler_unload",
+          "localized_name": "upscaler_unload",
+          "name": "upscaler_unload",
+          "type": "BOOLEAN",
           "widget": {
-            "name": "run_name"
+            "name": "upscaler_unload"
           },
           "link": null
         }
@@ -961,52 +1026,74 @@
           "name": "LATENT",
           "type": "LATENT",
           "links": [
-            351,
-            353
+            554
           ]
         },
         {
-          "label": "preview_video",
-          "localized_name": "preview_video",
-          "name": "preview_video",
+          "label": "draft_video",
+          "localized_name": "draft_video",
+          "name": "draft_video",
           "type": "STRING",
-          "links": null
+          "links": [
+            555
+          ]
         },
         {
           "label": "workflow_json",
           "localized_name": "workflow_json",
           "name": "workflow_json",
           "type": "STRING",
-          "links": null
+          "links": [
+            556
+          ]
+        },
+        {
+          "label": "workflow_api",
+          "localized_name": "workflow_api",
+          "name": "workflow_api",
+          "type": "STRING",
+          "links": [
+            557
+          ]
         }
       ],
       "properties": {
-        "Node name for S&R": "SelfLiftH3Draft",
+        "Node name for S&R": "SelfLiftH3DraftSampler",
         "ver": "b143ed2731438e606c7a6c70ee580a1f86e7bf72",
         "widget_ue_connectable": {},
         "aux_id": "facok/comfyui-SelfLift"
       },
       "widgets_values": [
         684655983592117,
-        "fixed",
+        "randomize",
         1,
-        2,
+        5,
         0.4,
-        "taeh3.safetensors",
+        0.6000000000000001,
+        0.5,
+        1,
+        "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
         true,
+        "taeh3.safetensors",
         25.0,
-        "selflift"
+        true,
+        true
       ],
       "widgets_values_named": {
         "seed": 684655983592117,
-        "control_after_generate": "fixed",
+        "control_after_generate": "randomize",
         "cfg": 1,
-        "transition_step": 2,
+        "transition_step": 5,
         "lowres_scale": 0.4,
+        "rho": 0.6000000000000001,
+        "w_min": 0.5,
+        "w_max": 1,
+        "upscaler_model": "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
+        "draft_mode": true,
         "preview_vae": "taeh3.safetensors",
-        "preview_video": true,
         "fps": 25.0,
-        "run_name": "selflift"
+        "highres_tiling": true,
+        "upscaler_unload": true
       },
       "color": "#323",
       "bgcolor": "#535"
@@ -1045,7 +1132,8 @@
           "type": "VAE",
           "links": [
             394,
-            395
+            395,
+            396
           ]
         }
       ],
@@ -1112,7 +1200,7 @@
           "links": [
             368,
             369,
-            554
+            558
           ]
         }
       ],
@@ -1527,7 +1615,7 @@
           "widget": {
             "name": "preview_frames"
           },
-          "link": null
+          "link": 303
         },
         {
           "label": "preview_fps",
@@ -2041,7 +2129,8 @@
           "name": "INT",
           "type": "INT",
           "links": [
-            275
+            275,
+            303
           ]
         },
         {
@@ -2626,9 +2715,114 @@
         "icc_mode": "convert",
         "upload": "image"
       }
+    },
+    {
+      "id": 400,
+      "type": "SelfLiftH3Save",
+      "pos": [
+        2640.7,
+        700.0
+      ],
+      "size": [
+        420,
+        240
+      ],
+      "flags": {},
+      "order": 24,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "latent",
+          "localized_name": "latent",
+          "name": "latent",
+          "type": "LATENT",
+          "link": 554
+        },
+        {
+          "label": "draft_video",
+          "localized_name": "draft_video",
+          "name": "draft_video",
+          "type": "STRING",
+          "link": 555
+        },
+        {
+          "label": "workflow_json",
+          "localized_name": "workflow_json",
+          "name": "workflow_json",
+          "type": "STRING",
+          "link": 556
+        },
+        {
+          "label": "workflow_api",
+          "localized_name": "workflow_api",
+          "name": "workflow_api",
+          "type": "STRING",
+          "link": 557
+        },
+        {
+          "label": "output_folder",
+          "localized_name": "output_folder",
+          "name": "output_folder",
+          "type": "STRING",
+          "widget": {
+            "name": "output_folder"
+          },
+          "link": null
+        },
+        {
+          "label": "file_name",
+          "localized_name": "file_name",
+          "name": "file_name",
+          "type": "STRING",
+          "widget": {
+            "name": "file_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "latent",
+          "localized_name": "latent",
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            351,
+            353
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SelfLiftH3Save",
+        "ver": "1.0"
+      },
+      "widgets_values": [
+        "",
+        "",
+        "",
+        "selflift",
+        "selflift"
+      ],
+      "widgets_values_named": {
+        "draft_video": "",
+        "workflow_json": "",
+        "workflow_api": "",
+        "output_folder": "selflift",
+        "file_name": "selflift"
+      },
+      "color": "#323",
+      "bgcolor": "#535"
     }
   ],
   "links": [
+    [
+      303,
+      131,
+      1,
+      153,
+      6,
+      "INT"
+    ],
     [
       343,
       136,
@@ -2666,7 +2860,7 @@
       136,
       1,
       171,
-      3,
+      4,
       "LATENT"
     ],
     [
@@ -2674,12 +2868,12 @@
       123,
       0,
       171,
-      4,
+      5,
       "SAMPLER"
     ],
     [
       351,
-      171,
+      400,
       0,
       122,
       0,
@@ -2687,7 +2881,7 @@
     ],
     [
       353,
-      171,
+      400,
       0,
       121,
       0,
@@ -2707,6 +2901,14 @@
       0,
       122,
       1,
+      "VAE"
+    ],
+    [
+      396,
+      215,
+      0,
+      171,
+      3,
       "VAE"
     ],
     [
@@ -2730,7 +2932,7 @@
       224,
       0,
       171,
-      5,
+      6,
       "SIGMAS"
     ],
     [
@@ -2887,10 +3089,42 @@
     ],
     [
       554,
+      171,
+      0,
+      400,
+      0,
+      "LATENT"
+    ],
+    [
+      555,
+      171,
+      1,
+      400,
+      1,
+      "STRING"
+    ],
+    [
+      556,
+      171,
+      2,
+      400,
+      2,
+      "STRING"
+    ],
+    [
+      557,
+      171,
+      3,
+      400,
+      3,
+      "STRING"
+    ],
+    [
+      558,
       184,
       0,
       171,
-      13,
+      8,
       "VAE"
     ]
   ],

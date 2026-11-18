@@ -170,11 +170,12 @@
     }
   },
   "171": {
-    "class_type": "SelfLiftH3Draft",
+    "class_type": "SelfLiftH3DraftSampler",
     "inputs": {
       "model": ["153", 0],
       "positive": ["136", 0],
       "negative": ["173", 0],
+      "vae": ["215", 0],
       "latent_image": ["136", 1],
       "sampler": ["123", 0],
       "sigmas": ["224", 0],
@@ -182,11 +183,27 @@
       "cfg": 1.0,
       "transition_step": 5,
       "lowres_scale": 0.4,
+      "rho": 0.6,
+      "w_min": 0.5,
+      "w_max": 1.0,
+      "upscaler_model": "minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
+      "draft_mode": true,
       "preview_vae": "taeh3.safetensors",
-      "preview_video": true,
       "fps": 25.0,
-      "audio_vae": ["184", 0],
-      "run_name": "selflift"
+      "highres_tiling": true,
+      "upscaler_unload": true,
+      "audio_vae": ["184", 0]
+    }
+  },
+  "905": {
+    "class_type": "SelfLiftH3Save",
+    "inputs": {
+      "latent": ["171", 0],
+      "draft_video": ["171", 1],
+      "workflow_json": ["171", 2],
+      "workflow_api": ["171", 3],
+      "output_folder": "selflift",
+      "file_name": "selflift"
     }
   },
   "901": {

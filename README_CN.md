@@ -34,25 +34,32 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 
 从 [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) 下载，放入 `ComfyUI/models/latent_upscale_models/` 后重启。节点默认选第一个文件名含 `h3` 的模型，找不到则为 `none`(nearest 提升）。
 
-## 低分辨率草稿（MiniMax H3）
+## 草稿模式（MiniMax H3）
 
-`SelfLiftH3Draft` 只跑一次运行里的低分辨率前缀就停下，把那份低分辨率 latent 交出来。它还会用 `models/vae_approx` 里的快速解码器（H3 是 `taeh3`，由 `preview_vae` 指定）把前缀画成一个 mp4，存到 `output/selflift/`。预览**保持前缀自己的分辨率，不做任何放大**——放大的预览只会凭空造出前缀没有的细节。接上 `audio_vae` 还会带上声音。
+两个节点，原来的采样器一点没动：`SelfLiftH3Sampler` 保持原样，草稿模式全部在它自己的新节点里。
 
 | 节点 | 作用 |
 | --- | --- |
-| `SelfLiftH3Sampler` | 完整运行：低分辨率前缀 → 提升到目标分辨率 → 跑完剩余调度 |
-| `SelfLiftH3Draft` | 只跑低分辨率前缀，输出低分辨率 latent，并写出自己的预览 mp4 和工作流 JSON |
+| `SelfLiftH3DraftSampler` | 带草稿模式的采样器。`draft_mode` 开：草稿——只采样低分辨率前缀，不做放大、不做高分辨率阶段，latent 也不往下游传。前缀用快速解码器（`taeh3`）画出来，这次运行写成两份标准工作流（草稿模式翻成关）。`draft_mode` 关：完整流程，这个节点和普通采样器没有任何区别。它输出 latent，以及这次运行产出的三个文件。 |
+| `SelfLiftH3Save` | 把这些文件归档，并决定 latent 怎么办。草稿模式：文件挪到它指定的目录和名字下，latent 自己留着，后面的解码链不跑。生产模式：latent 直接直通，什么都不写。 |
 
-**草稿节点会交回三样东西。** 除了低分辨率 latent，它还往 `output/selflift/` 写两个文件，并把路径一起返回：
+开关放在采样节点上，保存节点从那里读它——这样两个节点不可能对"这次是草稿还是生产"产生分歧：一个开关，不是两个。
 
-| 输出 | 文件 | 内容 |
+**三个文件从哪来到哪去**：
+
+| `SelfLiftH3DraftSampler` 的输出 | 是什么 | `SelfLiftH3Save` 存成 |
 | --- | --- | --- |
-| `preview_video` | `draft_<名字>_<时间>.mp4` | 用 `models/vae_approx` 里的快速解码器（H3 是 `taeh3`，由 `preview_vae` 指定）画出的前缀，保持前缀自己的分辨率。接上 `audio_vae` 还会带上声音。 |
-| `workflow_json` | `draft_<名字>_<时间>.json` | 这次运行本身：参数、API 图、以及（从界面触发时的）UI 工作流。够用来复现这次运行，或者事后看清当时到底要了什么。 |
+| `draft_video` | 用 `models/vae_approx` 里的快速解码器（H3 是 `taeh3`，由 `preview_vae` 指定）画出的前缀，保持前缀自己的分辨率——**不做任何放大**，放大的预览只会凭空造出前缀没有的细节。接上 `audio_vae` 还会带上声音。 | `<目录>/<名字>_<时间>.mp4` |
+| `workflow_json` | **标准格式的 ComfyUI 工作流**：从界面触发时是画布上的图，从 API 触发时是 API 提示图——两种前端都认，把文件拖进画布就能打开。 | `<目录>/<名字>_<时间>.workflow.json` |
+| `workflow_api` | 同一次运行的 API 提示图，可直接 `POST /prompt`。 | `<目录>/<名字>_<时间>.api.json` |
 
-`preview_video`（默认开启）与 `fps`（默认 25）控制预览；`run_name` 决定这两个文件叫什么。
+保存节点上填 `output_folder`（ComfyUI 输出目录下的子文件夹，默认 `selflift`）和 `file_name`（文件名前缀，默认 `selflift`，后面自动加运行时间）。文件是**移动**而不是复制：采样节点先把它们留在 `output/selflift/.staging/` 暂存区，保存节点负责把它们归位。
 
-**预览有多大，取决于前缀有多大。** 预览的像素数是 `目标像素 × lowres_scale`，按原样解码。所以想要更清楚的预览，应该调 `lowres_scale`（前缀变大，成片不变），而不是调目标分辨率（预览和成片一起变大——成片的每个高分辨率步骤、以及提升时的 VAE 往返都按目标面积涨）。
+没有别的运行记录文件：参数本来就是工作流里各节点自己的 widget 值、API 图里各节点的 inputs，两份文件里都已经有了。
+
+**存下来的工作流就是能出成片的那次运行。** 里面采样节点的 `draft_mode` 是关的，所以把文件拖回画布，跑出来的是成片，不是草稿。图还是你跑的那张：解码链挂在保存节点后面，保存节点把 latent 直通下去。
+
+**草稿有多大，取决于前缀有多大。** 草稿的像素数是 `目标像素 × lowres_scale`，按原样解码。所以想要更清楚的草稿，应该调 `lowres_scale`（前缀变大，成片不变），而不是调目标分辨率（草稿和成片一起变大——成片的每个高分辨率步骤、以及提升时的 VAE 往返都按目标面积涨）。
 
 **同一条轨迹，不是另一个样本。** 用与完整运行相同的 seed、提示词、参考图和 `transition_step` 跑草稿，得到的正是完整运行**一开始的那一段**：完整运行接下来做的，就是把它提升到目标分辨率、重新加噪、继续跑完。所以草稿里的构图、主体、动态走向就是成片的走向。
 
@@ -65,7 +72,7 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 
 **参考复原会对齐。** keep-region 锚点和 noise mask 会自动插值到前缀网格；参考图本身用 `ref_image_size='match'` 缩到当前生成分辨率。实测 `'match'` 与 `'max'` 两种编码出来的参考，画面几乎一致，所以这一步不是关键；关键是**草稿和完整运行用同一套参考设置**，以及草稿落在与前缀相同的网格上（同一网格 + 同一 seed = 同一份噪声 = 同一条轨迹）。
 
-`workflows/h3-draft.api.json` 是 API 格式的草稿图，可直接 `POST /prompt`。`workflows/H3 SelfLift Preview｜Low-res Draft.json` 是 UI 格式版本，由"H3 SelfLift Dual Sample"工作流派生，多了一条草稿分支和它自己的解码/保存尾巴。
+`workflows/h3-draft.api.json` 是 API 格式的草稿图，可直接 `POST /prompt`。`workflows/H3 SelfLift Draft Mode.json` 是 UI 格式版本，由"H3 SelfLift Dual Sample"工作流派生，把保存节点插在采样节点和解码链之间。
 
 ## H3 Temporal State Transport (TST)
 
@@ -81,6 +88,41 @@ H3 音视频实验性适配（论文未验证）。两种模式：
 诊断行包含：latent 帧数、每帧网格行数、调用内校正前/后的张力、平均 γ、被校正头比例、TST 自身耗时。真实 H3 运行上，校正方向与精确注意力算子的逐头一致率为 89–100%。调试时可在启动 ComfyUI 前设 `SELFLIFT_TST_EXACT=1`，在每次前向的一层上输出精确算子对比（很慢，仅调试用）。
 
 限制：仅支持 MiniMax H3（其它模型静默跳过）;**与 `highres_tiling` 不兼容**（跳过并给出控制台警告）。
+
+## 和 H3 Studio 一起用
+
+[ComfyUI-H3Studio](https://github.com/mr7thing/ComfyUI-H3Studio) 决定**给模型什么**（关键帧、参考、时间线），
+SelfLift 决定**怎么采**。两边真正共享的只有一样东西：条件字典。
+完整契约见 [`COLLABORATION.md`](COLLABORATION.md)，这里是速查版。
+
+| 从 | 到 | 说明 |
+| --- | --- | --- |
+| `UNETLoader` | `SelfLiftH3TST` | TST 只在打过补丁的模型上生效 |
+| `H3StudioImageToVideo` → `positive` | `SelfLiftH3DraftSampler` → `positive` | |
+| `H3StudioImageToVideo` → `positive` | `ConditioningZeroOut` → `negative` | |
+| `H3StudioImageToVideo` → `LATENT` | `SelfLiftH3DraftSampler` → `latent_image` | 决定目标尺寸和时长 |
+| `H3StudioImageToVideo` → `v2v_denoise` | `H3BasicScheduler` → `denoise` | **必须接** —— 不接 v2v 会静默退化成满 denoise |
+| `H3BasicScheduler` → `SIGMAS` | `SelfLiftH3DraftSampler` → `sigmas` | 不是 KSampler 的 denoise |
+| `KSamplerSelect`（`euler`） | `SelfLiftH3DraftSampler` → `sampler` | SelfLift 只支持 Euler |
+| 视频 / 音频 `VAELoader` | `vae` / `audio_vae` | 预览 mp4 会带上声音 |
+
+现成的工作流在 `workflows/H3 Studio x SelfLift Draft Mode.json`；
+`tools/make_h3studio_workflow.py` 可以重新生成它，并把模型名换成本机实际有的那些。
+
+草稿采样器为 H3 Studio 额外做的几件事（原 `SelfLiftH3Sampler` 一个字节没动）：
+
+- **关键帧的噪声被补回来。** H3 Studio 用 `z' = a·z + (1-a)·noise` 弱化关键帧，
+  并把 `a` 以 `noise_aug` 的形式留在条件里。把这个关键帧平均到低分辨率网格上时，
+  噪声也跟着被平均掉了 —— 所以草稿采样器改用面积采样（而不是双线性），
+  再按 `1-noise_aug` 把缺的噪声补回去。**所有关键帧都走面积采样**（面积采样才是缩小时的
+  正确滤波器，双线性会混叠）；但没有 `noise_aug` 的关键帧**一分噪声都不补** ——
+  它的强度不可知，瞎补会改坏它。
+- **TST 和 `highres_tiling` 一起用会直接报错。** tiling 的 wrapper 坐在 TST 里面，
+  分块 attention 永远到不了校正，TST 会被静默跳过。所以草稿采样器选择报错而不是装作没事。
+- **不是从纯噪声起步时会说明。** 调度表起点低于 sigma 1.0 时，这次运行是从源 latent
+  部分去噪起步（v2v / 图生图语义），日志里会写清楚。
+- **多帧关键帧块会说明。** motion context 钉住的帧和别的关键帧一起被降分辨率，
+  所以这里的接缝可能不如原生 H3 Studio 流程干净。
 
 ## 诊断 H3
 

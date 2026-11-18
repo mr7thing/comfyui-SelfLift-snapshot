@@ -34,25 +34,32 @@ Extra inputs: `upscaler_model`, `upscaler_unload` (default on: unloads the upsca
 
 Download from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) into `ComfyUI/models/latent_upscale_models/` and restart. The node selects the first filename containing `h3`, otherwise `none` (nearest-neighbor lift).
 
-## Low-resolution draft (MiniMax H3)
+## Draft mode (MiniMax H3)
 
-`SelfLiftH3Draft` runs the low-resolution prefix of a run and stops there. It hands back that low-resolution latent and, with `preview_video` on, draws it with the small decoder in `models/vae_approx` (`taeh3`) and writes an mp4 to `output/selflift_drafts/`. The preview keeps the prefix's own resolution: nothing is scaled up, because a scaled-up preview only invents detail the prefix never had. Connect `audio_vae` and the preview carries the soundscape too.
+Two nodes, and the plain sampler stays out of it: `SelfLiftH3Sampler` is untouched, the draft mode lives in its own nodes.
 
 | Node | What it does |
 | --- | --- |
-| `SelfLiftH3Sampler` | The full run: low-resolution prefix → lift to the target resolution → finish the schedule. |
-| `SelfLiftH3Draft` | Runs the low-resolution prefix only, returns the low-resolution latent and writes the preview mp4 and the workflow JSON. |
+| `SelfLiftH3DraftSampler` | The sampler with a draft mode. `draft_mode` on: a draft -- only the low-resolution prefix is sampled, no lift and no high-resolution steps, and the latent does not travel on. The prefix is drawn with the fast decoder (`taeh3`) and the run is written down as two standard workflows with the draft mode switched off. `draft_mode` off: the full run, and the node behaves exactly like `SelfLiftH3Sampler`. It outputs the latent and the three files the run produced. |
+| `SelfLiftH3Save` | Files those files away and decides what happens to the latent. A draft run: the files move into the folder and under the name it was given, and the latent is kept, so the decoders downstream stay quiet. A full run: the latent passes straight through and nothing is written. |
 
-**What the draft hands back.** Besides the low-resolution latent it writes two files of its own into `output/selflift/` and returns their paths:
+The switch lives on the sampler, and the save node reads it from there, so the two cannot disagree about what the run was — one switch, not two.
 
-| Output | File | What it is |
+**The files**, and where they come from:
+
+| Output of `SelfLiftH3DraftSampler` | What it is | Filed by `SelfLiftH3Save` as |
 | --- | --- | --- |
-| `preview_video` | `draft_<name>_<time>.mp4` | The prefix drawn with the fast decoder from `models/vae_approx` (`preview_vae`, `taeh3` for H3), at the prefix's own resolution. Connect `audio_vae` and it carries the soundscape too. |
-| `workflow_json` | `draft_<name>_<time>.json` | The run as it was: the parameters, the API graph and the UI graph it came from. Enough to repeat the run or to see afterwards what was asked for. |
+| `draft_video` | The prefix drawn with the fast decoder from `models/vae_approx` (`preview_vae`, `taeh3` for H3), at the prefix's own resolution — nothing is scaled up, because a scaled-up preview only invents detail the prefix never had. Connect `audio_vae` and it carries the soundscape too. | `<folder>/<name>_<time>.mp4` |
+| `workflow_json` | A standard ComfyUI workflow: the canvas graph when the run came from the canvas, the API prompt when it did not. Drop the file on the canvas and it opens. | `<folder>/<name>_<time>.workflow.json` |
+| `workflow_api` | The API prompt of the same run, ready for `POST /prompt`. | `<folder>/<name>_<time>.api.json` |
 
-`preview_video` (default on) and `fps` (default 25) control the preview; `run_name` names both files.
+The save node takes `output_folder` (a folder under the ComfyUI output directory, `selflift` by default) and `file_name` (the name the files are filed under, `selflift` by default; the time of the run is added to it). It moves the files rather than copying them: the sampler leaves them in a staging folder under `output/selflift/.staging/`, and this node is where they end up.
 
-**The preview is as big as the prefix, not as big as the target.** Its pixel count is `target megapixels × lowres_scale`, decoded as it is. That is the whole sizing question: raising `lowres_scale` makes the preview bigger and leaves the finished clip alone, while raising the target makes both bigger — every high-resolution step and the lift's VAE round trip scale with the target's area.
+There is no other run record: the parameters are the nodes' own widget values in the workflow and the inputs in the API prompt, so they are already in both files.
+
+**The workflow that comes out is the run that produces.** The sampler's `draft_mode` is off in it, so the file you drop back on the canvas makes the clip, not a draft of it. The graph is the one you ran: the decoders hang off the save node and the save node passes the latent on.
+
+**The draft is as big as the prefix, not as big as the target.** Its pixel count is `target megapixels × lowres_scale`, decoded as it is. That is the whole sizing question: raising `lowres_scale` makes the draft bigger and leaves the finished clip alone, while raising the target makes both bigger — every high-resolution step and the lift's VAE round trip scale with the target's area.
 
 **The same trajectory, not a second sample.** With the same seed, prompt, reference setup and `transition_step` as the full run, the draft is literally the first stretch of that run: what the full run does next is lift the prefix to the target resolution, re-noise it and finish the schedule. The composition, the subject and the movement in the draft are the ones the finished clip grows out of.
 
@@ -65,7 +72,7 @@ For both at once: raise the full run's `transition_step` so more of the content 
 
 **The references line up.** The keep-region anchor and the noise mask are interpolated onto the prefix grid automatically; the reference images themselves follow `ref_image_size='match'`, which scales them to the current generation resolution. Measured against each other, the `'match'` and the `'max'` encodings give nearly the same picture, so this is not the sensitive part; what matters is that **the draft and the full run use the same reference setup**, and that the draft lands on the same grid as the prefix (same grid plus same seed means the same noise means the same trajectory).
 
-`workflows/h3-draft.api.json` is the draft graph in the API format, ready for `POST /prompt`. `workflows/H3 SelfLift Preview｜Low-res Draft.json` is the same graph in the UI format, derived from the "H3 SelfLift Dual Sample" workflow with a draft branch and its own decode-and-save tail added.
+`workflows/h3-draft.api.json` is the draft graph in the API format, ready for `POST /prompt`. `workflows/H3 SelfLift Draft Mode.json` is the same graph in the UI format, derived from the "H3 SelfLift Dual Sample" workflow with the save node put between the sampler and the decoders.
 
 ## H3 Temporal State Transport (TST)
 
@@ -81,6 +88,30 @@ How it works, in one paragraph: instead of blindly strengthening cross-frame att
 The diagnostics line reports latent frames, grid rows per frame, tension before/after the within-call correction, mean gamma, the share of corrected heads, and TST's own runtime. On real H3 runs the correction direction matched the exact attention operator for 89–100% of heads. Set `SELFLIFT_TST_EXACT=1` before starting ComfyUI to log the exact-operator comparison on one layer per forward (debug only, slow).
 
 Limitations: MiniMax H3 models only (other models are skipped silently); **not compatible with `highres_tiling`** (skipped with a console warning).
+
+## Using it with H3 Studio
+
+[ComfyUI-H3Studio](https://github.com/mr7thing/ComfyUI-H3Studio) decides *what the model gets* — keyframes, references, the timeline — and SelfLift decides *how it is sampled*. The two share exactly one thing: the conditioning dictionary. The full contract is in [`COLLABORATION.md`](COLLABORATION.md); this is the short version.
+
+| From | To | Note |
+| --- | --- | --- |
+| `UNETLoader` | `SelfLiftH3TST` | TST only acts on a patched model |
+| `H3StudioImageToVideo` → `positive` | `SelfLiftH3DraftSampler` → `positive` | |
+| `H3StudioImageToVideo` → `positive` | `ConditioningZeroOut` → `negative` | |
+| `H3StudioImageToVideo` → `LATENT` | `SelfLiftH3DraftSampler` → `latent_image` | sets the target size and duration |
+| `H3StudioImageToVideo` → `v2v_denoise` | `H3BasicScheduler` → `denoise` | **required** — unwired, v2v silently becomes a full denoise |
+| `H3BasicScheduler` → `SIGMAS` | `SelfLiftH3DraftSampler` → `sigmas` | not a KSampler denoise |
+| `KSamplerSelect` (`euler`) | `SelfLiftH3DraftSampler` → `sampler` | SelfLift supports Euler only |
+| video / audio `VAELoader` | `vae` / `audio_vae` | the preview mp4 carries the soundscape |
+
+A ready-made graph ships in `workflows/H3 Studio x SelfLift Draft Mode.json`; `tools/make_h3studio_workflow.py` regenerates it and swaps in the model names actually present on this machine.
+
+What the draft sampler adds for H3 Studio (the plain `SelfLiftH3Sampler` is untouched, byte for byte):
+
+- **Keyframe noise is put back.** H3 Studio weakens a keyframe by blending noise into it (`z' = a·z + (1-a)·noise`) and keeps `a` in the condition as `noise_aug`. Averaging that keyframe down to the low-resolution grid averages its noise away with it, so the draft sampler resamples by area rather than bilinear and adds the missing noise back in, scaled by `1-noise_aug`. Every keyframe is area-resampled — area is the correct filter for downscaling and bilinear aliases — but a keyframe with no `noise_aug` gets no noise added, because its strength is not knowable and guessing would damage it.
+- **`highres_tiling` and TST are refused together.** The tiling wrapper sits inside TST's, so tiled attention never reaches the correction and TST would be skipped without a trace. The draft sampler raises instead.
+- **A start below pure noise is called out.** When the schedule starts under sigma 1.0 the run begins from the source latent (v2v / img2img semantics), and the log says so.
+- **Multi-frame keyframe blocks are called out.** Motion-context pins get downscaled together with everything else in the low-resolution prefix, so the join can be softer here than in a native H3 Studio run.
 
 ## Diagnosing H3
 
