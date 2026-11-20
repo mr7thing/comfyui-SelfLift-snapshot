@@ -181,9 +181,18 @@ def main():
         def __init__(self):
             super().__init__()
             self.lines = []
+            self.records = []
 
         def emit(self, record):
             self.lines.append(record.getMessage())
+            self.records.append(record)
+
+        def warnings(self):
+            return [r.getMessage() for r in self.records if r.levelno >= logging.WARNING]
+
+        def clear(self):
+            self.lines.clear()
+            self.records.clear()
 
     capture = Capture()
     root = logging.getLogger()
@@ -196,16 +205,47 @@ def main():
         check("a start below pure noise is called out",
               any("sigma" in line for line in capture.lines),
               capture.lines[0] if capture.lines else "nothing logged")
-        capture.lines.clear()
+        capture.clear()
         new["_note_h3_studio_conditions"](keyframe_cond(torch.zeros(1, 16, 3, 8, 8)),
                                          torch.tensor([1.0, 0.5, 0.0]))
         check("a multi-frame keyframe block is called out",
               any("multi-frame" in line for line in capture.lines),
               capture.lines[0] if capture.lines else "nothing logged")
-        capture.lines.clear()
+        capture.clear()
+        # A plain run -- one keyframe, no label, no strength -- cannot be told
+        # apart from a weakened one, so it says so; but it must not warn.
         new["_note_h3_studio_conditions"](keyframe_cond(torch.zeros(1, 16, 1, 8, 8)),
                                          torch.tensor([1.0, 0.5, 0.0]))
-        check("a plain run says nothing", not capture.lines, str(capture.lines))
+        check("a plain run raises no warning", not capture.warnings(), str(capture.lines))
+        check("a plain run says what it cannot tell",
+              any("cannot tell" in line for line in capture.lines),
+              capture.lines[0] if capture.lines else "nothing logged")
+        capture.clear()
+        # A keyframe at full strength has no noise to put back: nothing to say.
+        new["_note_h3_studio_conditions"](
+            keyframe_cond(torch.zeros(1, 16, 1, 8, 8), extra={"strength": 1.0}),
+            torch.tensor([1.0, 0.5, 0.0]))
+        check("a keyframe at full strength says nothing", not capture.lines, str(capture.lines))
+        capture.clear()
+        # A keyframe that was weakened and lost its label is a real loss: warn.
+        new["_note_h3_studio_conditions"](
+            keyframe_cond(torch.zeros(1, 16, 1, 8, 8), extra={"strength": 0.65}),
+            torch.tensor([1.0, 0.5, 0.0]))
+        check("a weakened keyframe without a label is warned about",
+              any("weakened" in line for line in capture.warnings()),
+              capture.lines[0] if capture.lines else "nothing logged")
+        check("the weakened-keyframe warning names the visible effect",
+              any("soft" in line for line in capture.warnings()),
+              capture.lines[0] if capture.lines else "nothing logged")
+        capture.clear()
+        # A labelled keyframe proves the per-row mechanism was available, so an
+        # unlabelled one next to it can only have been left at full strength.
+        both = keyframe_cond(torch.zeros(1, 16, 1, 8, 8), noise_aug=0.649)
+        both[0][1]["minimax_keyframes"].append(
+            {"resolved_frame_index": 1, "latent": torch.zeros(1, 16, 1, 8, 8)})
+        new["_note_h3_studio_conditions"](both, torch.tensor([1.0, 0.5, 0.0]))
+        check("an unlabelled keyframe next to a labelled one says nothing",
+              not capture.lines, str(capture.lines))
     finally:
         root.setLevel(old_level)
         root.removeHandler(capture)

@@ -29,7 +29,8 @@ SelfLift 不认识 H3 Studio 的节点，只认识条件字典里的键：
 |---|---|---|
 | `minimax_keyframes` | H3 Studio（`h3_studio.py:2020`）、核心 guide | `_resize_keyframes()`：低分辨率段要把关键帧缩到低分辨率网格上 |
 | `minimax_keyframes[i]["latent"]` | 同上 | 5D `[B,C,T,h,w]`，按帧做空间缩放，**不跨时间插值** |
-| `minimax_keyframes[i]["noise_aug"]` | H3 Studio（`strength < 1.0` 且 row-aug 生效时） | `= strength × 0.999`。**这是 SelfLift 唯一能拿到的强度信息** —— `strength` 本身被 `kf.pop("strength")` 丢掉了 |
+| `minimax_keyframes[i]["noise_aug"]` | H3 Studio（`strength < 1.0` 且 row-aug 生效时） | `= strength × 0.999`。噪声占比 `1 - noise_aug`，低分辨率段据此补噪 |
+| `minimax_keyframes[i]["strength"]` | H3 Studio（fork `feat/keep-keyframe-strength` 起保留） | 「这个关键帧到底被削弱了没有」。**没有它就分不清「满强度」和「标签缺失」**（§6.4） |
 
 条件字典的顶层键 (`minimax_refs` / `minimax_frame_count` / `minimax_prompt_text`)
 SelfLift 一个都不读，也不改。参考块用自己的网格，不受 §3.3 约束，SelfLift 原样传下去。
@@ -60,7 +61,9 @@ TST 假设「video 行是 packed 序列的最后一段」，按
 核心 0.45 的段序是 `[text, cond, ref_img, audio, video]`，video 确实最后
 （已实测 `frames × rows_per_frame` 与布局的 video 段行数严格相等）。
 
-**SelfLift 侧目前没有运行期自保**（见 §6 待办）。
+**SelfLift 侧现在有运行期自保**（§6.2）：每次 forward 都读核心放在
+`transformer_options["minimax_h3_layout"]` 里的段表，核对最后一段确实是
+`video`、且行数等于 `frames × rows_per_frame`；不是就直接抛错，不再默默打偏。
 
 ### 3.3 关键帧 latent 必须与生成分辨率同网格
 
@@ -104,7 +107,8 @@ SelfLift 的 `_resize_keyframes` 再做双线性缩放 + 均值匹配 —— 噪
 
 **没有 `noise_aug` 的关键帧不会被补噪** —— 那是全强度的帧，或者是被
 `weaken_cond_latent`（另一条不标 `noise_aug` 的弱化路径）改过的帧，强度信息不可知，
-瞎补会改坏它。
+瞎补会改坏它。fork 从 `feat/keep-keyframe-strength` 起把 `strength` 留在字典里，
+所以这个「不可知」现在是**可以判定的**：见 §6.4。
 
 注意区分两件事：**缩放方式**统一是「所有关键帧都用面积采样」（面积采样才是缩小时的
 正确滤波器，双线性会混叠）；**补多少噪声**才按 `noise_aug` 分情况 —— 有标签就按
@@ -195,16 +199,98 @@ VAELoader(audio) ──> audio_vae ───────────────
 
 ---
 
-## 6. 待办（SelfLift 侧，还没做）
+## 6. 运行时自保（这一节原来全是待办）
 
-| # | 事项 | 触发条件 | 风险 |
-|---|---|---|---|
-| A | **§5.1 override 链式包裹**：SelfLift 若再加一个注意力层改动，必须套在 TST 外面而不是覆盖它 | 有人加第二个注意力改动时 | 静默失效：后写的把 TST 挤掉 |
-| B | **§5.2 packed 段序运行期自保**：采样前检查 video 段确实是 packed 序列最后一段 | H3 Studio 新增一种会进 packed 序列的条件 kind 时 | TST 定位错行 → 校正打错地方，不报错 |
-| C | **§7.2 `minimax_h3_studio_meta` 读取**：对方答应加 `kind/strength/pinned` 元信息；有了它才能对 `pinned` 的帧走「不降分辨率」 | 对方实现 §7.2 后 | motion_context 接缝持续打折（§4.2） |
-| D | **§7.1 `strength` 保留**：对方答应在关键帧字典里留 `strength`；现在只能用 `noise_aug / 0.999` 反推 | 对方实现 §7.1 后 | 精度：反推是精确的（`noise_aug = strength × 0.999` 恒等），但没有 `strength` 就分不清「strength=1.0」和「标签缺失」 |
+四项里有三项已经落地成**会响的东西**，一项是跨两边的改动。共同原则：
+**该报错就报错，该说清楚就说清楚，说了要能当行动指令用。**
 
-B 是三个里最该先做的：**它保护的是「对方加了个新 kind，结果 TST 默默打偏」这种不会报错的事故。**
+| # | 事项 | 状态 | 触发条件 | 现在的行为 |
+|---|---|---|---|---|
+| A | **override 单槽冲突** | ✅ 已做 | 装 TST 时槽里已经有别人 | **抛错拒绝安装** |
+| B | **packed 段序自保** | ✅ 已做 | video 不再是最后一段 | **每次 forward 抛错** |
+| C | **`minimax_h3_studio_meta`** | 🟡 降级提示 | 对方还没标 `pinned` | **warning**，说清接缝会打折 |
+| D | **`strength` 保留** | ✅ 已做（跨两边） | —— | 只在**真损失**时 warning |
+
+### 6.1 A：单槽冲突 → 拒绝安装
+
+`optimized_attention_override` 是单槽，后写覆盖前写。`h3_tst.py` 的
+`_check_override_slot()` 在 `patch_model()` 里看这个槽：
+
+- **空** → 正常装。
+- **不空** → **直接抛错**，不装。报错写清四件事：单槽的覆盖语义、
+  两个改写本来应该一起跑而一个槽装不下、链式包裹的具体做法
+  （override 的第一个参数就是下层的 `func`）、以及在处理完之前
+  把哪一条从链上拿掉。
+
+> **A 的固有局限**：只能发现「装 TST **之前**槽就满了」。
+> **装完之后被别人覆盖**，运行期发现不了 —— 事后没人能说清谁覆盖了谁。
+
+### 6.2 B：packed 段序 → 每次 forward 都抛
+
+TST 用 `v0 = s - frames × rows_per_frame` 从**序列末尾往前数**定位视频行，
+所以「video 是最后一段」是硬前提。
+
+`_check_packed_order()` 每次 forward 读核心放在
+`transformer_options["minimax_h3_layout"]` 里的段表（`layout.segments`，
+`(start, stop, kind)` 的连续段表），核对两件事：最后一段的 kind 必须是
+`video`；它的行数必须等于 `frames × rows_per_frame`。
+
+不满足就 **抛 `ValueError`**，报错里写明：最后一段是什么、末尾三段
+各自的 kind 和行号、期望多少行、为什么这会让 TST 打偏、怎么退出，
+以及段序是从哪个 `transformer_options` 键读来的。
+
+> **为什么不警告而是报错**：这是唯一一类「完全静默且结果错误」的事故
+> —— TST 的张力数字照打，只是算在了错的行上。警告会被忽略。
+>
+> **为什么不按长度推算**：只有 video 后面还压了别的段时，长度推算和
+> 正常布局长得一模一样 —— 只有段表能分开这两种情况。
+>
+> **为什么每次 forward 都抛，不去重**：去重会让被上层捕获的异常在下一次
+> forward 失效，等于给检查开后门。
+>
+> **依赖点**：核心内部约定 `transformer_options["minimax_h3_layout"]`。
+> 核心升级若改了名，这个检查会**静默失效**（拿不到段表就直接放行）。
+
+### 6.3 C：motion_context 多帧块 → warning
+
+多帧关键帧块（motion context / 视频锚）会被低分辨率段一起缩到小网格，
+钉住的帧因此被「减半再抬回来」，接缝处可能有一帧的软。
+`nodes.py` 的 `_note_h3_studio_conditions()` 会在每次这样的运行里
+warning 一次，写清四件事：**原因**（关键帧必须坐在生成分辨率网格上，
+低分辨率段有自己的小网格）、**可见效果**（接缝处一帧的软或小跳，
+在头发/树叶/织物这种密纹理上最明显，镜头一动就明显）、
+**本地能不能修**（不能）、**真正的解法**（对方在
+`minimax_h3_studio_meta` 里标 `pinned`，SelfLift 就可以让这种帧保持原分辨率）。
+
+### 6.4 D：分不清「满强度」和「标签缺失」→ 只在真损失时报
+
+`noise_aug` **只在 flow-blend 那条路上写**。所以一个没有标签的关键帧，
+要么本来就是满强度，要么是被 `weaken_cond_latent` 改过（弱化路径不写标签）。
+前者没事，后者**噪声比例未知，低分辨率缩放之后补不回来**。
+
+只靠标签分不出来，但**两侧一起就能分清**：
+
+- **H3 Studio 侧**（fork `feat/keep-keyframe-strength`）：把 `strength`
+  留在关键帧字典里。它对核心是惰性的（核心只读 `latent` 和 `noise_aug`），
+  只告诉对面这个帧到底被削弱了没有。
+- **SelfLift 侧**：按下面的表判定，**只在真损失时 warning**。
+
+| 关键帧的状态 | 判定 | 行为 |
+|---|---|---|
+| 有 `noise_aug` | 被削弱过，噪声比例精确 | 安静，补噪照做 |
+| 有 `strength` 且 `>= 1.0` | 从没被削弱，没有噪声要补 | 安静 |
+| 有 `strength` 且 `< 1.0`、无标签 | **真损失**：被削弱了，噪声比例未知 | **warning** |
+| 两者都没有 | 分不清是满强度还是标签缺失 | **info**：说清自己看不到什么、为什么、怎么才能看到 |
+
+最后一行还有一条**运行期自己做的推断**：标签只在「被削弱」时写，所以运行里
+只要**有一个**带标签的关键帧，就证明 per-row 那套机制当时是通的，同一个运行里
+没有标签的关键帧就只能是满强度 —— 这种组合一个字都不说。
+
+多帧块（motion context）不进这张表：它的 latent 是成片素材，不是被削弱的静图，
+那是 §6.3 的事。
+
+> **还没对称的一件事**：声音锚（`audio_noise_aug`）走的是同一套逻辑，
+> 同样在弱化路径上不写标签，但 SelfLift 不消费声音关键帧，所以没有对等检查。
 
 ---
 
@@ -225,12 +311,13 @@ $py='C:\Users\dream\AppData\Local\Comfy-Desktop\ComfyUI-Installs\Comfyui\ComfyUI
 & $py 'C:\Users\dream\Desktop\works\comfy-dev\h3studio_patch_compat_check.py'
 ```
 
-SelfLift 自己还有两个离线检查（**不导入 ComfyUI**，可以随便跑）：
+SelfLift 自己还有三个离线检查（**不导入 ComfyUI**，可以随便跑）：
 
 | 脚本 | 查什么 |
 |---|---|
-| `tools/test_h3_studio_coop.py` | 关键帧缩放路径：原采样器逐比特不变、补噪精度、`_tst_installed` 不误认 |
-| `tools/check_ui_workflow.py` | 工作流 JSON 的节点 / 连线完整性 |
+| `tools/test_h3_studio_coop.py` | 关键帧缩放路径：原采样器逐比特不变、补噪精度、`_tst_installed` 不误认；以及 C/D 警告的**触发条件**（普通运行不报警、满强度不报警、被削弱却丢标签才报） |
+| `tools/test_runtime_guards.py` | 运行时守卫：packed 段序（B）、override 单槽（A）、C/D 警告是不是 warning 而不是 error |
+| `tools/check_ui_workflow.py` | 工作流 JSON 的节点 / 连线完整性（要带工作流路径参数） |
 
 **规矩**：任何一边动了「会影响对方的槽位」，先在对方仓库提一条 issue 或者直接跑一遍
 对方的检查脚本，把结果贴过去。不要等对方踩到。

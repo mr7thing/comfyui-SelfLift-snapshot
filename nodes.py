@@ -353,21 +353,108 @@ def _tst_installed(model):
 
 
 def _note_h3_studio_conditions(cond, sigmas):
-    """Say out loud what the H3 Studio cooperation path changes about this run."""
+    """Say out loud what the H3 Studio cooperation path changes about this run.
+
+    Every line here answers one question: what will this run do differently
+    from a native H3 Studio run, and what does that cost. A warning that only
+    says "degraded" is not actionable; each one names the cause, the visible
+    effect, whether it can be fixed on this side, and what the real fix is.
+
+    A warning also has to be worth reading: one that fires on every ordinary
+    run teaches the reader to skip it. So each check below fires only on a
+    state that is actually wrong, and a state that cannot be told apart from a
+    harmless one stays quiet -- or says plainly that it cannot tell.
+
+    The keyframe states, as far as this side can see them:
+
+      noise_aug present         the keyframe was weakened through the flow-blend
+                                path; the noise fraction is exact and the noise
+                                can be put back after the downscale.
+      strength present, >= 1.0  the keyframe was never weakened, so there is no
+                                noise to put back and nothing to say.
+      strength present, < 1.0   the keyframe was weakened by a path that does
+                                not label it: the noise fraction is unknown and
+                                the noise cannot be put back. A real loss.
+      neither                   the keyframe was either left alone or weakened
+                                by a path that does not say so, and the two look
+                                the same from here.
+
+    One more inference the run makes on its own: the label is written only when
+    the keyframe is weakened, so a labelled keyframe anywhere in the run proves
+    the per-row noise-aug mechanism was available, and an unlabelled keyframe
+    in the same run can only have been left at full strength. That is why an
+    unlabelled keyframe next to a labelled one is not worth a word.
+    """
     if sigmas.numel() > 1 and float(sigmas[0]) < 1.0:
         logging.info("[SelfLift H3 Studio] this schedule starts at sigma=%.4f instead of at pure noise: "
                      "the run begins from the source latent (v2v / img2img semantics).",
                      float(sigmas[0]))
-    for tensor, d in cond:
-        blocks = 0
+    blocks = 0
+    labelled = 0
+    weakened = 0
+    unknown = 0
+    for _tensor, d in cond:
         for kf in d.get("minimax_keyframes") or []:
             lat = kf.get("latent")
-            if lat is not None and lat.ndim == 5 and lat.shape[2] > 1:
+            if lat is None:
+                continue
+            if lat.ndim == 5 and lat.shape[2] > 1:
+                # A multi-frame block is motion context: its latent is final
+                # footage, not a still that was weakened, so the noise question
+                # below does not apply to it -- the C check has it.
                 blocks += 1
-        if blocks:
-            logging.info("[SelfLift H3 Studio] %d multi-frame keyframe block(s) (motion context / video anchor) "
-                         "are downscaled with the low-resolution prefix: the keyframe grid rule leaves no other "
-                         "option, so the join can be softer here than in a native H3 Studio run.", blocks)
+                continue
+            if kf.get("noise_aug") is not None:
+                labelled += 1
+                continue
+            strength = kf.get("strength")
+            if strength is None:
+                unknown += 1
+            elif float(strength) < 1.0:
+                weakened += 1
+    if blocks:
+        logging.warning(
+            "[SelfLift H3 Studio] %d multi-frame keyframe block(s) (motion context / video anchor) "
+            "will be downscaled with the low-resolution prefix. Cause: the keyframe grid rule "
+            "requires a keyframe latent to sit on the generation grid, and the low-resolution "
+            "prefix has its own smaller grid, so the block cannot keep its original size. "
+            "Visible effect: the pinned frame is halved and lifted back, so a segment that "
+            "starts from this one can show a one-frame softness or a small jump at the join -- "
+            "clearest on dense texture such as hair, foliage or fabric, and clearest when the "
+            "camera moves. It is not a bug and there is no local fix: the real fix is for "
+            "H3 Studio to tag the block as pinned in 'minimax_h3_studio_meta', which lets "
+            "SelfLift keep such a frame at its own resolution. Until then, expect the join to "
+            "be slightly softer than a native H3 Studio run.", blocks)
+    if weakened:
+        logging.warning(
+            "[SelfLift H3 Studio] %d keyframe(s) were weakened but carry no 'noise_aug' label, so "
+            "the noise they carry is unknown and cannot be put back after the low-resolution "
+            "downscale. Cause: H3 Studio writes the label only when it weakens a keyframe through "
+            "the flow-blend path; this one was weakened by the fallback path (a linear blend "
+            "toward noise), which labels nothing -- the per-row noise-aug mechanism was not "
+            "available for it, so the noise fraction (1 - strength) is known on the H3 Studio "
+            "side and unknown here. Visible effect: the keyframe is averaged down to the "
+            "low-resolution grid and the noise goes down with it, so the frame it anchors can "
+            "read slightly soft -- most visible at the position it anchors, for instance a first "
+            "frame that reads slightly blurred while the rest of the clip sharpens; the loss "
+            "grows with the noise fraction. There is no fix on this side: only the side that "
+            "weakens a keyframe can write its label, and the 'strength' field that would give "
+            "the noise fraction away is dropped before the conditioning reaches here. The real "
+            "fix is to make the per-row noise-aug mechanism available, so H3 Studio takes the "
+            "flow-blend path and labels the row; keeping 'strength' in the keyframe dictionary "
+            "would also let a run be inspected instead of silent.", weakened)
+    if unknown and not labelled:
+        logging.info(
+            "[SelfLift H3 Studio] %d keyframe(s) carry neither a 'noise_aug' label nor a "
+            "'strength' field, so this run cannot tell whether they were weakened. If one of "
+            "them was, the noise it carries was lost in the low-resolution downscale and cannot "
+            "be put back, and the frame it anchors can read slightly soft. Nothing is broken by "
+            "this -- every label that does exist is exact -- but the run cannot be inspected. "
+            "Cause: H3 Studio drops the 'strength' field when it builds the keyframe, so 'full "
+            "strength' and 'the label is missing' look the same from here. Fix: run an H3 Studio "
+            "build that keeps 'strength' in the keyframe dictionary; with it this run would say "
+            "exactly which keyframes were weakened instead of saying that it cannot tell.",
+            unknown)
 
 
 def _setup_run(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,

@@ -179,6 +179,59 @@ def _attention_override(state):
     return override
 
 
+
+def _check_packed_order(state, transformer_options):
+    """Check that the video segment really is the last one in the packed sequence.
+
+    TST locates the video rows by counting backwards from the end of the packed
+    sequence: v0 = s - frames * rows_per_frame. That is only right while the
+    video segment is the last one, which is what core 0.45 guarantees today
+    ("target audio (none for the image model) then target video, always last").
+
+    If a new conditioning kind is ever packed AFTER the video -- a video
+    reference, a mask reference, a second reel -- then v0 points into that
+    trailing segment instead of into the video, and the correction lands on the
+    wrong rows. Nothing raises: the tension numbers still print, they are just
+    computed over the wrong rows. That is the failure this check exists for.
+
+    The core hands the layout over in transformer_options["minimax_h3_layout"]
+    (the segment table it builds for the attention patches), so the check reads
+    the real spans instead of guessing them.
+    """
+    layout = transformer_options.get("minimax_h3_layout")
+    if layout is None:
+        return
+    segments = getattr(layout, "segments", None)
+    if not segments:
+        return
+    frames = state.get("frames")
+    rows = state.get("rows_per_frame")
+    if not frames or not rows:
+        return
+    start, stop, kind = segments[-1]
+    video_rows = frames * rows
+    if kind == "video" and (stop - start) == video_rows:
+        state["layout_checked"] = True
+        return
+    # something sits after the video segment: TST would locate the wrong rows
+    trailing = ", ".join("%s[%d:%d]" % (k, a, b) for a, b, k in segments[-3:])
+    message = (
+        "[H3 TST] the packed sequence does not end with the video segment: the last "
+        "segment is '%s' and the trailing spans are %s. TST locates the video rows by "
+        "counting backwards from the end of the sequence, so it would correct the wrong "
+        "rows and the result would silently get worse, not better. This happens when a "
+        "new conditioning kind is packed after the video (a video reference, a mask "
+        "reference, a second reel). Either remove the trailing segment or take the TST "
+        "node out of the model chain. Expected the last segment to be 'video' with %d "
+        "rows (frames=%d x rows_per_frame=%d), found '%s' with %d rows. The layout comes "
+        "from the core, under the transformer_options key 'minimax_h3_layout'."
+    ) % (kind, trailing, video_rows, frames, rows, kind, stop - start)
+    state["layout_error"] = message
+    # Raised on every forward, not only the first: the point of the check is that
+    # the run stops, and a dedup guard would let a caught exception let the next
+    # forward through with the same wrong layout.
+    raise ValueError(message)
+
 def _forward_wrapper(state, executor, x, timestep, context, transformer_options, minimax_payload=None, **kwargs):
     if state["calls_this_forward"] > 0:
         state["layers"] = state["calls_this_forward"]
@@ -206,8 +259,37 @@ def _forward_wrapper(state, executor, x, timestep, context, transformer_options,
         sigma = float(timestep.flatten()[0]) / 1000.0
         state["total_steps"] = max(1, int(sigmas.numel()) - 1)
         state["step"] = int((sigmas.float().cpu() - sigma).abs().argmin())
+    # the layout is rebuilt by the core for every forward, so this re-checks it
+    # every forward too: the segment order can change between steps if a
+    # conditioning block is added or removed mid-run.
+    _check_packed_order(state, transformer_options)
     return executor(x, timestep, context, transformer_options, minimax_payload=minimax_payload, **kwargs)
 
+
+
+def _check_override_slot(model):
+    """Report an attention override that is already in the single slot.
+
+    The core keeps one attention-rewrite entry point, and it is a single slot:
+    whoever writes it last wins. TST writes it, so anything already sitting
+    there is either another rewrite that is about to be overwritten, or a
+    rewrite that already overwrote TST.
+
+    The override is a closure, so its name says nothing about its owner. What
+    can be said is that it is not TST's own: TST installs into the slot only
+    here, so a slot that is already filled when this runs came from somebody
+    else. Refusing to start is the honest answer -- the run would otherwise
+    look fine and silently lose one of the two corrections.
+    """
+    try:
+        options = model.model_options or {}
+        transformer_options = options.get("transformer_options") or {}
+    except Exception:
+        return None
+    existing = transformer_options.get("optimized_attention_override")
+    if existing is None:
+        return None
+    return existing
 
 def patch_model(model, tau, log_diagnostics=True):
     state = {"tau": float(tau), "log_diagnostics": bool(log_diagnostics),
@@ -215,8 +297,21 @@ def patch_model(model, tau, log_diagnostics=True):
              "frames": None, "rows_per_frame": None,
              "step": 0, "total_steps": 1, "layers": 50, "calls_this_forward": 0,
              "guard_misses": 0, "warned_inactive": False,
+             "layout_checked": False, "layout_error": None,
              "fw_abs_tension": [], "fw_abs_tension_post": [], "fw_gamma": [], "fw_active": [],
              "fw_tst_time": [], "fw_events": []}
+    existing = _check_override_slot(model)
+    if existing is not None:
+        raise ValueError(
+            "SelfLift H3 TST: this model already carries an attention override in the core's "
+            "single 'optimized_attention_override' slot, and that slot only keeps one writer: "
+            "the last one wins. Installing TST now would silently replace it (and the other "
+            "way round, a rewrite installed after this node would silently replace TST). Both "
+            "corrections are supposed to run together, and the slot cannot hold them. The "
+            "override's first argument is the layer below it, so the two can be chained "
+            "instead: wrap the existing override with TST's, or wrap TST's with it. Until that "
+            "is done, take one of the two nodes out of the chain."
+        )
     patched = model.clone()
     patched.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
                                  "selflift_h3_tst", partial(_forward_wrapper, state))
